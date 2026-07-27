@@ -47,6 +47,7 @@
 #define SETTING_AUDIO_SOURCE "audio_source"
 #define SETTING_AUDIO_CODEC "audio_codec"
 #define SETTING_AUDIO_BIT_RATE "audio_bit_rate"
+#define SETTING_LOW_LATENCY "low_latency"
 
 #ifdef _WIN32
 static const char *const DEFAULT_ADB_PATH = "adb.exe";
@@ -78,6 +79,8 @@ struct scrcpy_source {
 	uint32_t frame_height;
 	bool hw_decoding;
 	bool audio_enabled;
+	/* Low-latency level: 0=Off, 1=Low, 2=Medium, 3=High */
+	uint8_t low_latency_level;
 	bool active;
 	bool restart_pending;
 	uint64_t restart_after_ns;
@@ -210,6 +213,12 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 	context->hw_decoding = hw_decoding;
 	context->audio_enabled = audio_enabled;
 
+	/* Low-latency level: clamp to [0..3] range */
+	long long low_latency = obs_data_get_int(settings, SETTING_LOW_LATENCY);
+	if (low_latency < 0) low_latency = 0;
+	if (low_latency > 3) low_latency = 3;
+	context->low_latency_level = (uint8_t)low_latency;
+
 	obs_log(LOG_INFO,
 		"scrcpy source updated: device='%s', source=%s, codec=%s, bitrate=%uMbps, max_size=%hu, camera_size=%s, audio=%s(%s)",
 		context->device_serial, context->video_source, context->video_codec, (uint32_t)video_bit_rate,
@@ -239,6 +248,7 @@ static void scrcpy_source_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, SETTING_AUDIO_SOURCE, "output");
 	obs_data_set_default_string(settings, SETTING_AUDIO_CODEC, "opus");
 	obs_data_set_default_int(settings, SETTING_AUDIO_BIT_RATE, 128);
+	obs_data_set_default_int(settings, SETTING_LOW_LATENCY, 0);
 }
 
 static bool scrcpy_video_source_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
@@ -317,6 +327,15 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 
 	obs_properties_add_bool(props, SETTING_HW_DECODING, "Use Hardware Decoding");
 
+	/* Low-latency dropdown — placed after HW Decoding since it's
+	 * directly related to video pipeline performance tuning. */
+	obs_property_t *latency_list = obs_properties_add_list(props, SETTING_LOW_LATENCY, "Low Latency",
+								       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(latency_list, "Off (Default)", 0);
+	obs_property_list_add_int(latency_list, "Low", 1);
+	obs_property_list_add_int(latency_list, "Medium", 2);
+	obs_property_list_add_int(latency_list, "High (Aggressive)", 3);
+
 	obs_properties_add_int_slider(props, SETTING_VIDEO_BIT_RATE, "Video bitrate (Mbps)", 1, 50, 1);
 
 	max_size_list = obs_properties_add_list(props, SETTING_MAX_SIZE, "Max resolution", OBS_COMBO_TYPE_LIST,
@@ -377,6 +396,7 @@ static void scrcpy_source_start_session(struct scrcpy_source *context)
 	config.audio_source = context->audio_source;
 	config.audio_codec = context->audio_codec;
 	config.audio_bit_rate = context->audio_bit_rate;
+	config.low_latency_level = context->low_latency_level;
 	config.on_frame = scrcpy_source_on_frame;
 	config.on_frame_opaque = context;
 	config.on_audio = scrcpy_source_on_audio;

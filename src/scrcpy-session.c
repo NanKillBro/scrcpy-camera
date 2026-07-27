@@ -67,6 +67,8 @@ struct scrcpy_session {
 	char *audio_source;
 	char *audio_codec;
 	uint32_t audio_bit_rate;
+	/* Low-latency level: 0=Off, 1=Low, 2=Medium, 3=High */
+	uint8_t low_latency_level;
 
 	scrcpy_session_frame_callback on_frame;
 	void *on_frame_opaque;
@@ -142,6 +144,7 @@ static void scrcpy_copy_config(struct scrcpy_session *session, const struct scrc
 	session->max_size = config->max_size;
 	session->hw_decoding = config->hw_decoding;
 	session->audio_enabled = config->audio_enabled;
+	session->low_latency_level = config->low_latency_level;
 	session->scid = (GetCurrentProcessId() ^ GetTickCount()) & 0x7fffffffU;
 	session->on_frame = config->on_frame;
 	session->on_frame_opaque = config->on_frame_opaque;
@@ -479,13 +482,40 @@ static bool scrcpy_open_video_socket(struct scrcpy_session *session)
 			return false;
 
 		if (connect(sock, (const struct sockaddr *)&addr, sizeof(addr)) == 0) {
-			int rcvbuf = 256 * 1024; /* OPT #2: 256KB receive buffer for burst absorption */
-			int nodelay = 1;         /* OPT #3: Disable Nagle for lower latency */
+			/*
+			 * Low-latency socket tuning:
+			 *   Level 0 (Off):    256 KB rcvbuf, 250 ms timeout
+			 *   Level 1 (Low):     64 KB rcvbuf, 100 ms timeout
+			 *   Level 2 (Medium):  32 KB rcvbuf,  50 ms timeout
+			 *   Level 3 (High):    16 KB rcvbuf,  30 ms timeout
+			 * Smaller buffers reduce buffering delay at the cost of
+			 * burst tolerance; shorter timeouts improve responsiveness.
+			 */
+			int rcvbuf;
+			int nodelay = 1; /* OPT #3: Disable Nagle for lower latency */
+			switch (session->low_latency_level) {
+			case 1:
+				rcvbuf = 64 * 1024;
+				timeout_ms = 100;
+				break;
+			case 2:
+				rcvbuf = 32 * 1024;
+				timeout_ms = 50;
+				break;
+			case 3:
+				rcvbuf = 16 * 1024;
+				timeout_ms = 30;
+				break;
+			default: /* Level 0: Off */
+				rcvbuf = 256 * 1024; /* OPT #2: 256KB receive buffer for burst absorption */
+				break;
+			}
 			setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
 			setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
 			setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
 			session->video_socket = sock;
-			obs_log(LOG_DEBUG, "connected to scrcpy TCP port %hu", session->local_port);
+			obs_log(LOG_DEBUG, "connected to scrcpy TCP port %hu (low_latency=%d, rcvbuf=%dKB, timeout=%dms)",
+				session->local_port, session->low_latency_level, rcvbuf / 1024, timeout_ms);
 			scrcpy_log_socket_available("after connect", sock);
 			return true;
 		}
@@ -739,6 +769,29 @@ static bool scrcpy_init_decoder(struct scrcpy_session *session, enum AVCodecID c
 		context->thread_count = 0; /* 0 = auto-detect (typically logical core count) */
 		context->thread_type = FF_THREAD_SLICE;
 		obs_log(LOG_INFO, "software decode: slice-threading enabled (auto thread count)");
+	}
+
+	/*
+	 * Low-latency decoder flag tuning:
+	 *   Level >= 1: AV_CODEC_FLAG_LOW_DELAY — disables decoder output reordering
+	 *               so frames are emitted as soon as they're decoded.
+	 *   Level >= 2: AV_CODEC_FLAG2_FAST — enables speed optimizations that may
+	 *               not conform to the spec but reduce decode time.
+	 *   Level >= 3: skip_loop_filter = AVDISCARD_ALL — skips the in-loop
+	 *               deblocking filter entirely; saves ~1 frame of decode time
+	 *               at the cost of slight edge blockiness.
+	 */
+	if (session->low_latency_level >= 1) {
+		context->flags |= AV_CODEC_FLAG_LOW_DELAY;
+		obs_log(LOG_INFO, "low-latency: decoder flag AV_CODEC_FLAG_LOW_DELAY enabled");
+	}
+	if (session->low_latency_level >= 2) {
+		context->flags2 |= AV_CODEC_FLAG2_FAST;
+		obs_log(LOG_INFO, "low-latency: decoder flag AV_CODEC_FLAG2_FAST enabled");
+	}
+	if (session->low_latency_level >= 3) {
+		context->skip_loop_filter = AVDISCARD_ALL;
+		obs_log(LOG_INFO, "low-latency: skip_loop_filter set to AVDISCARD_ALL");
 	}
 
 	if (avcodec_open2(context, codec, NULL) < 0) {
@@ -1015,13 +1068,32 @@ static bool scrcpy_open_audio_socket(struct scrcpy_session *session)
 			return false;
 
 		if (connect(sock, (const struct sockaddr *)&addr, sizeof(addr)) == 0) {
-			int rcvbuf = 256 * 1024; /* OPT #2: 256KB receive buffer */
-			int nodelay = 1;         /* OPT #3: Disable Nagle */
+			/* Low-latency audio socket tuning — same tiers as video socket */
+			int rcvbuf;
+			int nodelay = 1; /* OPT #3: Disable Nagle */
+			switch (session->low_latency_level) {
+			case 1:
+				rcvbuf = 64 * 1024;
+				timeout_ms = 100;
+				break;
+			case 2:
+				rcvbuf = 32 * 1024;
+				timeout_ms = 50;
+				break;
+			case 3:
+				rcvbuf = 16 * 1024;
+				timeout_ms = 30;
+				break;
+			default: /* Level 0: Off */
+				rcvbuf = 256 * 1024; /* OPT #2: 256KB receive buffer */
+				break;
+			}
 			setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
 			setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
 			setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
 			session->audio_socket = sock;
-			obs_log(LOG_DEBUG, "connected to scrcpy audio TCP port %hu", session->local_port);
+			obs_log(LOG_DEBUG, "connected to scrcpy audio TCP port %hu (low_latency=%d)",
+				session->local_port, session->low_latency_level);
 			return true;
 		}
 
@@ -1134,9 +1206,24 @@ static bool scrcpy_audio_decode_loop(struct scrcpy_session *session, AVCodecCont
 			obs_audio.speakers = SPEAKERS_STEREO;
 			obs_audio.format = AUDIO_FORMAT_16BIT;
 			obs_audio.samples_per_sec = 48000;
+			/*
+			 * Audio drift guard window — determines how far the
+			 * monotonic audio timestamp can drift from wall clock
+			 * before resetting. Tighter windows at higher low-latency
+			 * levels keep audio more closely synced to real-time.
+			 *   Level 0: 100 ms, Level 1: 50 ms,
+			 *   Level 2: 30 ms, Level 3: 20 ms
+			 */
+			uint64_t audio_drift_ns;
+			switch (session->low_latency_level) {
+			case 1:  audio_drift_ns = 50000000ULL;  break; /* 50 ms */
+			case 2:  audio_drift_ns = 30000000ULL;  break; /* 30 ms */
+			case 3:  audio_drift_ns = 20000000ULL;  break; /* 20 ms */
+			default: audio_drift_ns = 100000000ULL; break; /* 100 ms */
+			}
 			uint64_t now = os_gettime_ns();
-			if (session->next_audio_ts == 0 || now > session->next_audio_ts + 100000000ULL ||
-			    now < session->next_audio_ts - 100000000ULL)
+			if (session->next_audio_ts == 0 || now > session->next_audio_ts + audio_drift_ns ||
+			    now < session->next_audio_ts - audio_drift_ns)
 				session->next_audio_ts = now;
 
 			obs_audio.timestamp = session->next_audio_ts;
@@ -1225,9 +1312,17 @@ static bool scrcpy_audio_decode_loop(struct scrcpy_session *session, AVCodecCont
 				obs_audio.speakers = SPEAKERS_STEREO;
 				obs_audio.format = AUDIO_FORMAT_FLOAT;
 				obs_audio.samples_per_sec = frame->sample_rate;
+				/* Audio drift guard — same level-based window as raw PCM path */
+				uint64_t audio_drift_ns;
+				switch (session->low_latency_level) {
+				case 1:  audio_drift_ns = 50000000ULL;  break; /* 50 ms */
+				case 2:  audio_drift_ns = 30000000ULL;  break; /* 30 ms */
+				case 3:  audio_drift_ns = 20000000ULL;  break; /* 20 ms */
+				default: audio_drift_ns = 100000000ULL; break; /* 100 ms */
+				}
 				uint64_t now = os_gettime_ns();
-				if (session->next_audio_ts == 0 || now > session->next_audio_ts + 100000000ULL ||
-				    now < session->next_audio_ts - 100000000ULL)
+				if (session->next_audio_ts == 0 || now > session->next_audio_ts + audio_drift_ns ||
+				    now < session->next_audio_ts - audio_drift_ns)
 					session->next_audio_ts = now;
 
 				obs_audio.timestamp = session->next_audio_ts;
@@ -1368,9 +1463,23 @@ static unsigned __stdcall scrcpy_session_worker(void *opaque)
 
 		{
 			size_t len = strlen(command);
-			if (session->video_bit_rate != 8000000) {
+
+			/*
+			 * Low-latency bitrate capping:
+			 *   Level 1 (Low):    cap at 4 Mbps — faster encode, less data in flight
+			 *   Level 2 (Medium): cap at 2 Mbps
+			 *   Level 3 (High):   cap at 2 Mbps
+			 * Only caps if the user's chosen bitrate exceeds the limit.
+			 */
+			uint32_t effective_bit_rate = session->video_bit_rate;
+			if (session->low_latency_level >= 2 && effective_bit_rate > 2000000)
+				effective_bit_rate = 2000000;
+			else if (session->low_latency_level == 1 && effective_bit_rate > 4000000)
+				effective_bit_rate = 4000000;
+
+			if (effective_bit_rate != 8000000) {
 				len += _snprintf_s(command + len, sizeof(command) - len, _TRUNCATE,
-						   " video_bit_rate=%u", session->video_bit_rate);
+						   " video_bit_rate=%u", effective_bit_rate);
 			}
 
 			uint16_t max_size = session->max_size;
@@ -1416,6 +1525,18 @@ if (session->audio_enabled) {
 					len += _snprintf_s(command + len, sizeof(command) - len, _TRUNCATE,
 						   " audio_bit_rate=%u", session->audio_bit_rate);
 				}
+			}
+
+			/*
+			 * Low-latency I-frame interval:
+			 * At level 2+, force every frame to be an I-frame (no P-frames).
+			 * This eliminates decode-pipeline latency from reference frames
+			 * but significantly increases bandwidth usage.
+			 */
+			if (session->low_latency_level >= 2) {
+				len += _snprintf_s(command + len, sizeof(command) - len, _TRUNCATE,
+						   " i_frame_interval=1");
+				obs_log(LOG_INFO, "low-latency: i_frame_interval=1 appended to server command");
 			}
 		}
 
