@@ -18,12 +18,16 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/finders")
 find_package(libobs REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
+find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil swscale swresample)
+target_link_libraries(
+  ${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale FFmpeg::swresample
+)
+
 if(WIN32)
-  find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil swscale swresample)
-  target_link_libraries(
-    ${CMAKE_PROJECT_NAME}
-    PRIVATE OBS::libobs FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale FFmpeg::swresample ws2_32
-  )
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32)
+else()
+  find_package(Threads REQUIRED)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Threads::Threads)
 endif()
 
 if(ENABLE_FRONTEND_API)
