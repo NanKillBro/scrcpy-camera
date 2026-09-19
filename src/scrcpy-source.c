@@ -27,6 +27,16 @@
 #ifdef _WIN32
 #include <stdio.h>
 #include <windows.h>
+#else
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <time.h>
+
+#define _TRUNCATE
+#define _snprintf_s(dest, size, _truncate, ...) snprintf((dest), (size), __VA_ARGS__)
+#define strtok_s strtok_r
+#define Sleep(ms) nanosleep(&(struct timespec){.tv_sec = (ms) / 1000, .tv_nsec = ((ms) % 1000) * 1000000L}, NULL)
 #endif
 
 #define ADB_CMD_TIMEOUT_MS 3000
@@ -243,6 +253,7 @@ static void scrcpy_source_defaults(obs_data_t *settings)
 
 static bool scrcpy_video_source_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
+	UNUSED_PARAMETER(p);
 	const char *val = obs_data_get_string(settings, SETTING_VIDEO_SOURCE);
 	bool is_camera = (val && strcmp(val, "camera") == 0);
 	obs_property_t *cam_id_prop = obs_properties_get(props, SETTING_CAMERA_ID);
@@ -254,6 +265,7 @@ static bool scrcpy_video_source_changed(obs_properties_t *props, obs_property_t 
 
 static bool scrcpy_audio_enabled_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
+	UNUSED_PARAMETER(p);
 	bool enabled = obs_data_get_bool(settings, SETTING_AUDIO_ENABLED);
 	obs_property_t *source_prop = obs_properties_get(props, SETTING_AUDIO_SOURCE);
 	obs_property_set_visible(source_prop, enabled);
@@ -507,10 +519,13 @@ static int scrcpy_parse_adb_devices(FILE *pipe, obs_property_t *list)
 
 	return scrcpy_parse_adb_devices_from_string(output, list);
 }
-
 static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char *output, size_t output_size)
 {
 	char command[1024];
+
+	_snprintf_s(command, sizeof(command), _TRUNCATE, "%s %s", adb_path, args);
+
+#ifdef _WIN32
 	STARTUPINFOA si;
 	PROCESS_INFORMATION pi;
 	HANDLE stdout_read = NULL, stdout_write = NULL;
@@ -534,6 +549,7 @@ static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char 
 	si.cb = sizeof(si);
 	si.dwFlags = STARTF_USESHOWWINDOW;
 	si.wShowWindow = SW_HIDE;
+
 	if (stdout_write)
 		si.dwFlags |= STARTF_USESTDHANDLES, si.hStdOutput = stdout_write;
 
@@ -576,6 +592,28 @@ static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char 
 		CloseHandle(stdout_read);
 	CloseHandle(pi.hProcess);
 	return ok;
+#else
+	/* POSIX: run adb and capture stdout via a pipe. */
+	FILE *pipe = popen(command, "r");
+	if (!pipe) {
+		obs_log(LOG_WARNING, "failed to run adb command using '%s'", adb_path);
+		return false;
+	}
+
+	if (output && output_size > 0) {
+		size_t total = 0;
+		while (total < output_size - 1) {
+			size_t n = fread(output + total, 1, output_size - 1 - total, pipe);
+			if (n == 0)
+				break;
+			total += n;
+		}
+		output[total] = '\0';
+	}
+
+	int status = pclose(pipe);
+	return (status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+#endif
 }
 
 static int scrcpy_discover_mdns_devices(const char *adb_path)
@@ -641,7 +679,6 @@ static int scrcpy_refresh_device_list(struct scrcpy_source *context, obs_propert
 	obs_property_list_clear(list);
 	obs_property_list_add_string(list, "(Select device)", "");
 
-#ifdef _WIN32
 	if (!scrcpy_run_adb_command(adb_path, "devices -l", devices_output, sizeof(devices_output))) {
 		obs_log(LOG_WARNING, "failed to run adb command using '%s'", adb_path);
 		obs_property_list_add_string(list, "ADB command failed", "");
@@ -665,9 +702,6 @@ static int scrcpy_refresh_device_list(struct scrcpy_source *context, obs_propert
 				found = scrcpy_parse_adb_devices_from_string(devices_output, list);
 		}
 	}
-#else
-	UNUSED_PARAMETER(adb_path);
-#endif
 
 	if (found == 0)
 		obs_property_list_add_string(list, "No online ADB devices", "");
