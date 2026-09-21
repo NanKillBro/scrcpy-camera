@@ -20,7 +20,8 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
 find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil swscale swresample)
 target_link_libraries(
-  ${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale FFmpeg::swresample
+  ${CMAKE_PROJECT_NAME}
+  PRIVATE OBS::libobs FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale FFmpeg::swresample
 )
 
 if(WIN32)

@@ -225,8 +225,10 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 
 	/* Low-latency level: clamp to [0..3] range */
 	long long low_latency = obs_data_get_int(settings, SETTING_LOW_LATENCY);
-	if (low_latency < 0) low_latency = 0;
-	if (low_latency > 3) low_latency = 3;
+	if (low_latency < 0)
+		low_latency = 0;
+	if (low_latency > 3)
+		low_latency = 3;
 	context->low_latency_level = (uint8_t)low_latency;
 
 	/*
@@ -323,7 +325,8 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 			obs_property_list_add_string(device_list, context->device_serial, context->device_serial);
 	}
 
-	obs_properties_add_button2(props, "refresh_devices", "Refresh device list", scrcpy_refresh_button_clicked, context);
+	obs_properties_add_button2(props, "refresh_devices", "Refresh device list", scrcpy_refresh_button_clicked,
+				   context);
 	obs_properties_add_path(props, SETTING_SERVER_JAR_PATH, "scrcpy-server.jar path", OBS_PATH_FILE,
 				"Jar Files (*.jar);;All Files (*.*)", NULL);
 	obs_properties_add_text(props, SETTING_SCRCPY_VERSION, "scrcpy protocol version", OBS_TEXT_DEFAULT);
@@ -354,7 +357,7 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 	 * sizes, decoder flags, and OBS unbuffered async output. Higher levels
 	 * recover more aggressively at the cost of dropping more frames. */
 	obs_property_t *latency_list = obs_properties_add_list(props, SETTING_LOW_LATENCY, "Low Latency",
-								       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+							       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(latency_list, "Off (no frame dropping)", 0);
 	obs_property_list_add_int(latency_list, "Low (default, 150 ms)", 1);
 	obs_property_list_add_int(latency_list, "Medium (100 ms)", 2);
@@ -607,7 +610,8 @@ static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char 
 		DWORD available = 0, bytes_read = 0;
 		size_t total = 0;
 		Sleep(30); /* let adb stdout flush */
-		while (total < output_size - 1 && PeekNamedPipe(stdout_read, NULL, 0, NULL, &available, NULL) && available > 0) {
+		while (total < output_size - 1 && PeekNamedPipe(stdout_read, NULL, 0, NULL, &available, NULL) &&
+		       available > 0) {
 			DWORD to_read = (DWORD)(output_size - 1 - total);
 			if (to_read > available)
 				to_read = available;
