@@ -156,8 +156,8 @@ static void scrcpy_log_pipe_output(const char *prefix, void *pipe_handle);
 static bool scrcpy_should_stop(struct scrcpy_session *session);
 static bool scrcpy_open_video_socket(struct scrcpy_session *session);
 static bool scrcpy_open_audio_socket(struct scrcpy_session *session);
-static bool scrcpy_read_exact(struct scrcpy_session *session, int sock, void *buffer, size_t size);
-static void scrcpy_log_socket_available(const char *label, int sock);
+static bool scrcpy_read_exact(struct scrcpy_session *session, SOCKET sock, void *buffer, size_t size);
+static void scrcpy_log_socket_available(const char *label, SOCKET sock);
 static bool scrcpy_read_handshake(struct scrcpy_session *session, enum AVCodecID *codec_id, uint32_t *width,
 				  uint32_t *height);
 static bool scrcpy_read_audio_handshake(struct scrcpy_session *session, enum AVCodecID *codec_id);
@@ -249,8 +249,6 @@ bool scrcpy_session_is_running(const struct scrcpy_session *session)
 
 int scrcpy_session_start(struct scrcpy_session *session, const struct scrcpy_session_config *config)
 {
-	int create_ret;
-
 	if (!session || !config)
 		return -1;
 
@@ -275,6 +273,8 @@ int scrcpy_session_start(struct scrcpy_session *session, const struct scrcpy_ses
 
 	session->worker_thread = (HANDLE)thread_handle;
 #else
+	int create_ret;
+
 	__atomic_store_n(&session->stop_requested, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&session->running, 1, __ATOMIC_RELEASE);
 
@@ -350,14 +350,14 @@ static void scrcpy_close_stream_handles(struct scrcpy_session *session)
 		return;
 
 	if (session->video_socket != INVALID_SOCKET) {
-		shutdown(session->video_socket, SHUT_RDWR);
-		close(session->video_socket);
+		shutdown(session->video_socket, SD_BOTH);
+		closesocket(session->video_socket);
 		session->video_socket = INVALID_SOCKET;
 	}
 
 	if (session->audio_socket != INVALID_SOCKET) {
-		shutdown(session->audio_socket, SHUT_RDWR);
-		close(session->audio_socket);
+		shutdown(session->audio_socket, SD_BOTH);
+		closesocket(session->audio_socket);
 		session->audio_socket = INVALID_SOCKET;
 	}
 
@@ -1840,7 +1840,7 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 	int reconnect_attempts = 0;
 
 	if (!session)
-		return NULL;
+		return 0;
 
 #ifdef _WIN32
 	WSADATA wsadata;
@@ -2106,5 +2106,5 @@ if (session->audio_enabled) {
 #else
 	__atomic_store_n(&session->running, 0, __ATOMIC_RELEASE);
 #endif
-	return NULL;
+	return 0;
 }
