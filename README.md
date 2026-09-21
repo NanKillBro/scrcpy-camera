@@ -67,15 +67,7 @@ cmake --build build
 
 ### Linux (Ubuntu/Debian)
 
-The included `./build-install.sh` script builds and installs the plugin in one step. For a quick per-user install, run:
-
-```bash
-./build-install.sh
-```
-
-This builds the plugin and installs it into `~/.config/obs-studio/plugins/scrcpy-camera` (no `sudo` required). Use `./build-install.sh --help` to see options such as `--system` (system-wide install via `sudo`), `--no-build` (install an existing build), `--install-dir`, and `--dry-run`.
-
-To build manually, first install the required build dependencies:
+First install the required build dependencies:
 
 ```bash
 sudo apt install build-essential cmake ninja-build \
