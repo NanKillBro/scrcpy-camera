@@ -42,7 +42,6 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
     build-essential \
     libgles2-mesa-dev \
     libsimde-dev \
-    libobs-dev \
     libavcodec-dev \
     libavutil-dev \
     libswscale-dev \
