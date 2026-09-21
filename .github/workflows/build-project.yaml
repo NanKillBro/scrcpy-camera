@@ -155,9 +155,13 @@ jobs:
       run:
         shell: bash
     steps:
+      - name: Install Dependencies 🛍️
+        run: |
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Syu --noconfirm --needed git cmake ninja obs-studio ffmpeg jq tar xz
+
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
           fetch-depth: 0
 
       - name: Set Up Environment 🔧
@@ -166,9 +170,6 @@ jobs:
           : Set Up Environment 🔧
           if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
-
-          pacman -Sy --noconfirm archlinux-keyring
-          pacman -Syu --noconfirm --needed git cmake ninja obs-studio ffmpeg jq tar xz
 
           read -r product_name product_version <<< \
             "$(jq -r '. | {name, version} | join(" ")' buildspec.json)"
