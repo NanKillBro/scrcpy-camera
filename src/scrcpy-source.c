@@ -27,6 +27,16 @@
 #ifdef _WIN32
 #include <stdio.h>
 #include <windows.h>
+#else
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <time.h>
+
+#define _TRUNCATE
+#define _snprintf_s(dest, size, _truncate, ...) snprintf((dest), (size), __VA_ARGS__)
+#define strtok_s strtok_r
+#define Sleep(ms) nanosleep(&(struct timespec){.tv_sec = (ms) / 1000, .tv_nsec = ((ms) % 1000) * 1000000L}, NULL)
 #endif
 
 #define ADB_CMD_TIMEOUT_MS 3000
@@ -47,6 +57,7 @@
 #define SETTING_AUDIO_SOURCE "audio_source"
 #define SETTING_AUDIO_CODEC "audio_codec"
 #define SETTING_AUDIO_BIT_RATE "audio_bit_rate"
+#define SETTING_LOW_LATENCY "low_latency"
 
 #ifdef _WIN32
 static const char *const DEFAULT_ADB_PATH = "adb.exe";
@@ -78,6 +89,8 @@ struct scrcpy_source {
 	uint32_t frame_height;
 	bool hw_decoding;
 	bool audio_enabled;
+	/* Low-latency level: 0=Off, 1=Low, 2=Medium, 3=High */
+	uint8_t low_latency_level;
 	bool active;
 	bool restart_pending;
 	uint64_t restart_after_ns;
@@ -210,10 +223,27 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 	context->hw_decoding = hw_decoding;
 	context->audio_enabled = audio_enabled;
 
+	/* Low-latency level: clamp to [0..3] range */
+	long long low_latency = obs_data_get_int(settings, SETTING_LOW_LATENCY);
+	if (low_latency < 0)
+		low_latency = 0;
+	if (low_latency > 3)
+		low_latency = 3;
+	context->low_latency_level = (uint8_t)low_latency;
+
+	/*
+	 * Level >= 1 opts the source out of OBS's buffered async pacing, which is a
+	 * known latency ratchet: after a single late frame the async queue balloons
+	 * and never recovers (obsproject/obs-studio#11142). Unbuffered mode shows
+	 * the newest frame and drops expired ones. Level 0 keeps legacy pacing.
+	 */
+	obs_source_set_async_unbuffered(context->source, context->low_latency_level >= 1);
+
 	obs_log(LOG_INFO,
-		"scrcpy source updated: device='%s', source=%s, codec=%s, bitrate=%uMbps, max_size=%hu, camera_size=%s, audio=%s(%s)",
+		"scrcpy source updated: device='%s', source=%s, codec=%s, bitrate=%uMbps, max_size=%hu, camera_size=%s, audio=%s(%s), low_latency=%u",
 		context->device_serial, context->video_source, context->video_codec, (uint32_t)video_bit_rate,
-		context->max_size, context->camera_size, context->audio_enabled ? "on" : "off", context->audio_codec);
+		context->max_size, context->camera_size, context->audio_enabled ? "on" : "off", context->audio_codec,
+		(unsigned)context->low_latency_level);
 
 	if (context->active) {
 		context->restart_pending = true;
@@ -239,10 +269,14 @@ static void scrcpy_source_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, SETTING_AUDIO_SOURCE, "output");
 	obs_data_set_default_string(settings, SETTING_AUDIO_CODEC, "opus");
 	obs_data_set_default_int(settings, SETTING_AUDIO_BIT_RATE, 128);
+	/* Default Low: only drops frames once the backlog exceeds 150 ms, which never
+	 * happens on a healthy connection; it only acts to recover after stalls. */
+	obs_data_set_default_int(settings, SETTING_LOW_LATENCY, 1);
 }
 
 static bool scrcpy_video_source_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
+	UNUSED_PARAMETER(p);
 	const char *val = obs_data_get_string(settings, SETTING_VIDEO_SOURCE);
 	bool is_camera = (val && strcmp(val, "camera") == 0);
 	obs_property_t *cam_id_prop = obs_properties_get(props, SETTING_CAMERA_ID);
@@ -254,6 +288,7 @@ static bool scrcpy_video_source_changed(obs_properties_t *props, obs_property_t 
 
 static bool scrcpy_audio_enabled_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
+	UNUSED_PARAMETER(p);
 	bool enabled = obs_data_get_bool(settings, SETTING_AUDIO_ENABLED);
 	obs_property_t *source_prop = obs_properties_get(props, SETTING_AUDIO_SOURCE);
 	obs_property_set_visible(source_prop, enabled);
@@ -290,7 +325,8 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 			obs_property_list_add_string(device_list, context->device_serial, context->device_serial);
 	}
 
-	obs_properties_add_button2(props, "refresh_devices", "Refresh device list", scrcpy_refresh_button_clicked, context);
+	obs_properties_add_button2(props, "refresh_devices", "Refresh device list", scrcpy_refresh_button_clicked,
+				   context);
 	obs_properties_add_path(props, SETTING_SERVER_JAR_PATH, "scrcpy-server.jar path", OBS_PATH_FILE,
 				"Jar Files (*.jar);;All Files (*.*)", NULL);
 	obs_properties_add_text(props, SETTING_SCRCPY_VERSION, "scrcpy protocol version", OBS_TEXT_DEFAULT);
@@ -316,6 +352,16 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 	obs_property_list_add_string(codec_list, "H.265 (HEVC)", "h265");
 
 	obs_properties_add_bool(props, SETTING_HW_DECODING, "Use Hardware Decoding");
+
+	/* Low-latency dropdown: controls backlog catch-up thresholds, socket buffer
+	 * sizes, decoder flags, and OBS unbuffered async output. Higher levels
+	 * recover more aggressively at the cost of dropping more frames. */
+	obs_property_t *latency_list = obs_properties_add_list(props, SETTING_LOW_LATENCY, "Low Latency",
+							       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(latency_list, "Off (no frame dropping)", 0);
+	obs_property_list_add_int(latency_list, "Low (default, 150 ms)", 1);
+	obs_property_list_add_int(latency_list, "Medium (100 ms)", 2);
+	obs_property_list_add_int(latency_list, "High (60 ms)", 3);
 
 	obs_properties_add_int_slider(props, SETTING_VIDEO_BIT_RATE, "Video bitrate (Mbps)", 1, 50, 1);
 
@@ -377,6 +423,7 @@ static void scrcpy_source_start_session(struct scrcpy_source *context)
 	config.audio_source = context->audio_source;
 	config.audio_codec = context->audio_codec;
 	config.audio_bit_rate = context->audio_bit_rate;
+	config.low_latency_level = context->low_latency_level;
 	config.on_frame = scrcpy_source_on_frame;
 	config.on_frame_opaque = context;
 	config.on_audio = scrcpy_source_on_audio;
@@ -507,10 +554,13 @@ static int scrcpy_parse_adb_devices(FILE *pipe, obs_property_t *list)
 
 	return scrcpy_parse_adb_devices_from_string(output, list);
 }
-
 static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char *output, size_t output_size)
 {
 	char command[1024];
+
+	_snprintf_s(command, sizeof(command), _TRUNCATE, "%s %s", adb_path, args);
+
+#ifdef _WIN32
 	STARTUPINFOA si;
 	PROCESS_INFORMATION pi;
 	HANDLE stdout_read = NULL, stdout_write = NULL;
@@ -534,6 +584,7 @@ static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char 
 	si.cb = sizeof(si);
 	si.dwFlags = STARTF_USESHOWWINDOW;
 	si.wShowWindow = SW_HIDE;
+
 	if (stdout_write)
 		si.dwFlags |= STARTF_USESTDHANDLES, si.hStdOutput = stdout_write;
 
@@ -559,7 +610,8 @@ static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char 
 		DWORD available = 0, bytes_read = 0;
 		size_t total = 0;
 		Sleep(30); /* let adb stdout flush */
-		while (total < output_size - 1 && PeekNamedPipe(stdout_read, NULL, 0, NULL, &available, NULL) && available > 0) {
+		while (total < output_size - 1 && PeekNamedPipe(stdout_read, NULL, 0, NULL, &available, NULL) &&
+		       available > 0) {
 			DWORD to_read = (DWORD)(output_size - 1 - total);
 			if (to_read > available)
 				to_read = available;
@@ -576,6 +628,28 @@ static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char 
 		CloseHandle(stdout_read);
 	CloseHandle(pi.hProcess);
 	return ok;
+#else
+	/* POSIX: run adb and capture stdout via a pipe. */
+	FILE *pipe = popen(command, "r");
+	if (!pipe) {
+		obs_log(LOG_WARNING, "failed to run adb command using '%s'", adb_path);
+		return false;
+	}
+
+	if (output && output_size > 0) {
+		size_t total = 0;
+		while (total < output_size - 1) {
+			size_t n = fread(output + total, 1, output_size - 1 - total, pipe);
+			if (n == 0)
+				break;
+			total += n;
+		}
+		output[total] = '\0';
+	}
+
+	int status = pclose(pipe);
+	return (status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+#endif
 }
 
 static int scrcpy_discover_mdns_devices(const char *adb_path)
@@ -641,7 +715,6 @@ static int scrcpy_refresh_device_list(struct scrcpy_source *context, obs_propert
 	obs_property_list_clear(list);
 	obs_property_list_add_string(list, "(Select device)", "");
 
-#ifdef _WIN32
 	if (!scrcpy_run_adb_command(adb_path, "devices -l", devices_output, sizeof(devices_output))) {
 		obs_log(LOG_WARNING, "failed to run adb command using '%s'", adb_path);
 		obs_property_list_add_string(list, "ADB command failed", "");
@@ -665,9 +738,6 @@ static int scrcpy_refresh_device_list(struct scrcpy_source *context, obs_propert
 				found = scrcpy_parse_adb_devices_from_string(devices_output, list);
 		}
 	}
-#else
-	UNUSED_PARAMETER(adb_path);
-#endif
 
 	if (found == 0)
 		obs_property_list_add_string(list, "No online ADB devices", "");

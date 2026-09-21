@@ -45,6 +45,10 @@ struct scrcpy_session_config {
 	const char *audio_source;
 	const char *audio_codec;
 	uint32_t audio_bit_rate;
+	/* Low-latency level: 0=Off (default), 1=Low, 2=Medium, 3=High.
+	 * Higher levels progressively trade quality/stability for lower delay
+	 * by tuning socket buffers, decoder flags, and encoder parameters. */
+	uint8_t low_latency_level;
 	scrcpy_session_frame_callback on_frame;
 	void *on_frame_opaque;
 	scrcpy_session_audio_callback on_audio;
