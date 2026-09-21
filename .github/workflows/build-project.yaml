@@ -145,6 +145,63 @@ jobs:
           path: ${{ github.workspace }}/.ccache
           key: ${{ runner.os }}-${{ matrix.os }}-ccache-x86_64-${{ needs.check-event.outputs.config }}
 
+  archlinux-build:
+    name: Build for Arch Linux (FFmpeg 7+) 🏹
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    needs: check-event
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set Up Environment 🔧
+        id: setup
+        run: |
+          : Set Up Environment 🔧
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Syu --noconfirm --needed git cmake ninja obs-studio ffmpeg jq tar xz
+
+          read -r product_name product_version <<< \
+            "$(jq -r '. | {name, version} | join(" ")' buildspec.json)"
+
+          echo "pluginName=${product_name}" >> $GITHUB_OUTPUT
+          echo "pluginVersion=${product_version}" >> $GITHUB_OUTPUT
+
+      - name: Build Plugin 🧱
+        run: |
+          cmake --preset archlinux-x86_64
+          cmake --build --preset archlinux-x86_64
+
+      - name: Package Plugin 📀
+        run: |
+          mkdir -p package_staging/usr
+          cmake --install build_arch --prefix package_staging/usr
+
+          mkdir -p package_staging/${{ steps.setup.outputs.pluginName }}/bin/64bit
+          mkdir -p package_staging/${{ steps.setup.outputs.pluginName }}/data
+          cp build_arch/${{ steps.setup.outputs.pluginName }}.so package_staging/${{ steps.setup.outputs.pluginName }}/bin/64bit/
+          if [ -d data ]; then
+            cp -r data/* package_staging/${{ steps.setup.outputs.pluginName }}/data/
+          fi
+
+          mkdir -p release
+          tar -cJf release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-archlinux-x86_64.tar.xz -C package_staging .
+
+      - name: Upload Artifacts 📡
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-archlinux-x86_64-${{ needs.check-event.outputs.commitHash }}
+          path: ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-archlinux-x86_64.*
+
   windows-build:
     name: Build for Windows 🪟
     runs-on: windows-2022
