@@ -30,7 +30,7 @@
     },
     "name": "scrcpy-camera",
     "displayName": "scrcpy Camera",
-    "version": "1.3.0",
+    "version": "2.0.0",
     "author": "NanKill",
     "website": "https://github.com/NanKillBro/scrcpy-camera",
     "email": "nankill@nankill.xyz"
