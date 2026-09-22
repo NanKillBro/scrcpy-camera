@@ -1,7 +1,7 @@
 # scrcpy-camera - OBS Studio Plugin
 
 > [!WARNING]
-> **Hey there!** Just a quick heads-up: this plugin was purely "vibe-coded" in some day with the help of various AI models (GPT-5 mini, GPT-5.4 mini, GPT-5.3-Codex, Opus 4.6, Gemini 3.1 Pro, and Gemini 3.5 Flash). Because of this, the code quality isn't guaranteed and you might run into some bugs. PRs to fix issues or improve the code are more than welcome! Thanks for checking it out.
+> **Hey there!** Just a quick heads-up: this plugin was purely "vibe-coded" in some day with the help of various AI models. Because of this, the code quality isn't guaranteed and you might run into some bugs. PRs to fix issues or improve the code are more than welcome! Thanks for checking it out.
 
 ## Introduction
 
