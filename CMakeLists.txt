@@ -31,6 +31,10 @@ else()
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Threads::Threads)
 endif()
 
+if(APPLE)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE "-framework CoreFoundation")
+endif()
+
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
