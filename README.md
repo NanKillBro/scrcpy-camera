@@ -16,6 +16,7 @@ By integrating `scrcpy` directly into OBS Studio, this plugin eliminates the nee
 
 - **Direct Android Capture:** Connect to your Android device via ADB and capture its screen or camera directly in OBS.
 - **Screen & Camera Modes:** Choose to mirror the device's screen or use its front/back cameras as a webcam.
+- **Frame-rate Selection:** Cap the screen stream at 30/60 fps, or set the camera to 30/60 fps — camera sources additionally support 120/240 fps high-speed capture.
 - **Audio Forwarding:** Optionally capture device audio (Android 11+) with support for Output, Playback (Android 13+ duplication), and Mic sources plus Opus, AAC, FLAC, and raw PCM codecs.
 - **Hardware Decoding:** Utilizes FFmpeg hardware decoding (CUDA, QSV, D3D11VA, DXVA2; plus VAAPI and VDPAU on Linux) for optimized performance.
 - **Configurable Video Settings:** Adjust video codec (H.264, H.265), bitrate, maximum resolution, and camera size right from the OBS source properties.
@@ -47,10 +48,13 @@ By integrating `scrcpy` directly into OBS Studio, this plugin eliminates the nee
    - **ADB device:** Select your connected device from the dropdown, or click "Refresh device list" to scan.
    - **scrcpy-server.jar path:** Path to the `scrcpy-server.jar` file on your computer.
    - **Video source:** Choose between **Screen** (display mirroring) and **Camera**.
+   - **Frame rate:** Leave at **Default** (device default), or pick 30/60 fps. On **Camera** sources, 120 and 240 fps **High-speed** entries are also available.
    - **Video codec:** Choose between H.264 (AVC) and H.265 (HEVC).
    - **Video bitrate:** Set the desired bitrate for the stream.
    - **Max resolution:** Limit the maximum resolution of the stream.
 4. If using **Camera** mode, you can specify the **Camera ID** (e.g., `0` for Back, `1` for Front) and **Camera Size** (e.g., `1920x1080`).
+   > [!NOTE]
+   > Camera frame rates depend on what the camera exposes to the standard Android camera API — just because the stock camera app can record 60 fps (or even 4K60) does **not** mean scrcpy can capture 60 fps from it. High-speed (120/240 fps) additionally only works at size/fps combinations the device advertises. Check what your camera actually supports with desktop scrcpy (`scrcpy --video-source=camera --list-camera-sizes`); pick a smaller **Camera Size** if the stream fails to start (e.g. 1280x720 for 240 fps), and consider raising the **Video bitrate** for high frame rates.
 5. To enable **Audio Forwarding**, check "Enable Audio (Android 11+)", choose an **Audio Source** (Output, Playback for Android 13+ duplication audio, or Mic), then select your preferred audio codec (Opus, AAC, FLAC, or Raw PCM). You can also adjust the audio bitrate (default: 128 kbps).
 
 > [!NOTE]

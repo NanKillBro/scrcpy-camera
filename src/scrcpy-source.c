@@ -52,6 +52,7 @@
 #define SETTING_VIDEO_SOURCE "video_source"
 #define SETTING_CAMERA_ID "camera_id"
 #define SETTING_CAMERA_SIZE "camera_size"
+#define SETTING_FRAME_RATE "frame_rate"
 #define SETTING_HW_DECODING "hw_decoding"
 #define SETTING_AUDIO_ENABLED "audio_enabled"
 #define SETTING_AUDIO_SOURCE "audio_source"
@@ -85,6 +86,9 @@ struct scrcpy_source {
 	uint32_t video_bit_rate;
 	uint32_t audio_bit_rate;
 	uint16_t max_size;
+	uint16_t max_fps;
+	uint16_t camera_fps;
+	bool camera_high_speed;
 	uint32_t frame_width;
 	uint32_t frame_height;
 	bool hw_decoding;
@@ -232,6 +236,22 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 	context->hw_decoding = hw_decoding;
 	context->audio_enabled = audio_enabled;
 
+	/* Frame rate: screen uses the encoder-level max_fps cap, camera uses the
+	 * camera_fps AE range (high-speed >= 120 enables the high-speed session). */
+	long long frame_rate = obs_data_get_int(settings, SETTING_FRAME_RATE);
+	if (frame_rate < 0)
+		frame_rate = 0;
+	bool is_camera = strcmp(context->video_source, "camera") == 0;
+	if (is_camera) {
+		context->camera_high_speed = (frame_rate >= 120);
+		context->camera_fps = (uint16_t)frame_rate;
+		context->max_fps = 0;
+	} else {
+		context->max_fps = (frame_rate == 30 || frame_rate == 60) ? (uint16_t)frame_rate : 0;
+		context->camera_fps = 0;
+		context->camera_high_speed = false;
+	}
+
 	/* Low-latency level: clamp to [0..3] range */
 	long long low_latency = obs_data_get_int(settings, SETTING_LOW_LATENCY);
 	if (low_latency < 0)
@@ -248,9 +268,27 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 	 */
 	obs_source_set_async_unbuffered(context->source, context->low_latency_level >= 1);
 
+	char fps_desc[48];
+	if (is_camera) {
+		if (context->camera_high_speed) {
+			_snprintf_s(fps_desc, sizeof(fps_desc), _TRUNCATE, "camera %u (high-speed)",
+				    (unsigned)context->camera_fps);
+		} else if (context->camera_fps > 0) {
+			_snprintf_s(fps_desc, sizeof(fps_desc), _TRUNCATE, "camera %u", (unsigned)context->camera_fps);
+		} else {
+			_snprintf_s(fps_desc, sizeof(fps_desc), _TRUNCATE, "camera default");
+		}
+	} else {
+		if (context->max_fps > 0) {
+			_snprintf_s(fps_desc, sizeof(fps_desc), _TRUNCATE, "screen %u", (unsigned)context->max_fps);
+		} else {
+			_snprintf_s(fps_desc, sizeof(fps_desc), _TRUNCATE, "screen default");
+		}
+	}
+
 	obs_log(LOG_INFO,
-		"scrcpy source updated: device='%s', source=%s, codec=%s, bitrate=%uMbps, max_size=%hu, camera_size=%s, audio=%s(%s), low_latency=%u",
-		context->device_serial, context->video_source, context->video_codec, (uint32_t)video_bit_rate,
+		"scrcpy source updated: device='%s', source=%s, fps=%s, codec=%s, bitrate=%uMbps, max_size=%hu, camera_size=%s, audio=%s(%s), low_latency=%u",
+		context->device_serial, context->video_source, fps_desc, context->video_codec, (uint32_t)video_bit_rate,
 		context->max_size, context->camera_size, context->audio_enabled ? "on" : "off", context->audio_codec,
 		(unsigned)context->low_latency_level);
 
@@ -273,6 +311,7 @@ static void scrcpy_source_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, SETTING_VIDEO_SOURCE, "display");
 	obs_data_set_default_string(settings, SETTING_CAMERA_ID, "0");
 	obs_data_set_default_string(settings, SETTING_CAMERA_SIZE, "1920x1080");
+	obs_data_set_default_int(settings, SETTING_FRAME_RATE, 0);
 	obs_data_set_default_bool(settings, SETTING_HW_DECODING, true);
 	obs_data_set_default_bool(settings, SETTING_AUDIO_ENABLED, false);
 	obs_data_set_default_string(settings, SETTING_AUDIO_SOURCE, "output");
@@ -281,6 +320,18 @@ static void scrcpy_source_defaults(obs_data_t *settings)
 	/* Default Low: only drops frames once the backlog exceeds 150 ms, which never
 	 * happens on a healthy connection; it only acts to recover after stalls. */
 	obs_data_set_default_int(settings, SETTING_LOW_LATENCY, 1);
+}
+
+static void scrcpy_frame_rate_list_fill(obs_property_t *list, bool is_camera)
+{
+	obs_property_list_clear(list);
+	obs_property_list_add_int(list, "Default (device default)", 0);
+	obs_property_list_add_int(list, "30 fps", 30);
+	obs_property_list_add_int(list, "60 fps", 60);
+	if (is_camera) {
+		obs_property_list_add_int(list, "120 fps (High-speed)", 120);
+		obs_property_list_add_int(list, "240 fps (High-speed)", 240);
+	}
 }
 
 static bool scrcpy_video_source_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
@@ -292,6 +343,13 @@ static bool scrcpy_video_source_changed(obs_properties_t *props, obs_property_t 
 	obs_property_set_visible(cam_id_prop, is_camera);
 	obs_property_t *cam_size_prop = obs_properties_get(props, SETTING_CAMERA_SIZE);
 	obs_property_set_visible(cam_size_prop, is_camera);
+	obs_property_t *frame_rate_prop = obs_properties_get(props, SETTING_FRAME_RATE);
+	if (frame_rate_prop) {
+		scrcpy_frame_rate_list_fill(frame_rate_prop, is_camera);
+		/* A stale high-speed selection must never leak into screen mode. */
+		if (!is_camera && obs_data_get_int(settings, SETTING_FRAME_RATE) >= 120)
+			obs_data_set_int(settings, SETTING_FRAME_RATE, 0);
+	}
 	return true;
 }
 
@@ -345,6 +403,19 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 	obs_property_list_add_string(vsource_list, "Screen", "display");
 	obs_property_list_add_string(vsource_list, "Camera", "camera");
 	obs_property_set_modified_callback(vsource_list, scrcpy_video_source_changed);
+
+	obs_property_t *frame_rate_list = obs_properties_add_list(props, SETTING_FRAME_RATE, "Frame rate",
+								  OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	scrcpy_frame_rate_list_fill(frame_rate_list,
+				    context && context->video_source && strcmp(context->video_source, "camera") == 0);
+	obs_property_set_long_description(
+		frame_rate_list, "Screen: caps the encoder frame rate. Camera: sets the camera capture frame rate. "
+				 "Note that a camera app which can record 60 fps does not guarantee scrcpy can "
+				 "capture 60 fps - it depends on the frame rates the camera exposes to Android's "
+				 "camera API (check with desktop scrcpy: scrcpy --video-source=camera "
+				 "--list-camera-sizes). 120/240 fps use the camera high-speed capture session and "
+				 "only work at device-advertised size/fps combinations; you may need a smaller "
+				 "Camera Size (e.g. 1280x720 for 240 fps) and a higher video bitrate.");
 
 	cam_id_prop = obs_properties_add_list(props, SETTING_CAMERA_ID, "Camera ID", OBS_COMBO_TYPE_EDITABLE,
 					      OBS_COMBO_FORMAT_STRING);
@@ -430,6 +501,9 @@ static void scrcpy_source_start_session(struct scrcpy_source *context)
 	config.local_port = context->local_port;
 	config.video_bit_rate = context->video_bit_rate;
 	config.max_size = context->max_size;
+	config.max_fps = context->max_fps;
+	config.camera_fps = context->camera_fps;
+	config.camera_high_speed = context->camera_high_speed;
 	config.hw_decoding = context->hw_decoding;
 	config.audio_enabled = context->audio_enabled;
 	config.audio_source = context->audio_source;
