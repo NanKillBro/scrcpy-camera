@@ -104,6 +104,10 @@ static void scrcpy_source_tick(void *data, float seconds);
 static void scrcpy_source_stop_session(struct scrcpy_source *context);
 static void scrcpy_source_on_frame(void *opaque, const struct obs_source_frame *frame);
 static void scrcpy_source_on_audio(void *opaque, const struct obs_source_audio *audio);
+static bool scrcpy_source_is_in_use(struct scrcpy_source *context);
+static void scrcpy_source_check_state(struct scrcpy_source *context);
+static void scrcpy_source_show(void *data);
+static void scrcpy_source_hide(void *data);
 
 static uint32_t scrcpy_source_get_width(void *data)
 {
@@ -137,6 +141,7 @@ static void *scrcpy_source_create(obs_data_t *settings, obs_source_t *source)
 
 	obs_log(LOG_INFO, "creating scrcpy source scaffold");
 	scrcpy_source_update(context, settings);
+	scrcpy_source_check_state(context);
 	return context;
 }
 
@@ -145,6 +150,10 @@ static void scrcpy_source_destroy(void *data)
 	struct scrcpy_source *context = data;
 	if (!context)
 		return;
+
+	context->restart_pending = false;
+	context->active = false;
+	scrcpy_source_stop_session(context);
 
 	bfree(context->adb_path);
 	bfree(context->device_serial);
@@ -245,7 +254,7 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 		context->max_size, context->camera_size, context->audio_enabled ? "on" : "off", context->audio_codec,
 		(unsigned)context->low_latency_level);
 
-	if (context->active) {
+	if (scrcpy_source_is_in_use(context)) {
 		context->restart_pending = true;
 		context->restart_after_ns = os_gettime_ns() + 800000000ULL; /* 800 ms debounce */
 	}
@@ -407,6 +416,9 @@ static void scrcpy_source_start_session(struct scrcpy_source *context)
 	if (!context || !context->session)
 		return;
 
+	if (scrcpy_session_is_running(context->session))
+		return;
+
 	config.adb_path = context->adb_path;
 	config.device_serial = context->device_serial;
 	config.server_jar_path = context->server_jar_path;
@@ -461,6 +473,34 @@ static void scrcpy_source_on_audio(void *opaque, const struct obs_source_audio *
 	obs_source_output_audio(context->source, audio);
 }
 
+static bool scrcpy_source_is_in_use(struct scrcpy_source *context)
+{
+	if (!context || !context->source)
+		return false;
+
+	return obs_source_showing(context->source) || obs_source_active(context->source);
+}
+
+static void scrcpy_source_check_state(struct scrcpy_source *context)
+{
+	if (!context)
+		return;
+
+	bool in_use = scrcpy_source_is_in_use(context);
+	context->active = in_use;
+
+	if (in_use) {
+		if (!scrcpy_session_is_running(context->session)) {
+			scrcpy_source_start_session(context);
+		}
+	} else {
+		context->restart_pending = false;
+		if (scrcpy_session_is_running(context->session)) {
+			scrcpy_source_stop_session(context);
+		}
+	}
+}
+
 static void scrcpy_source_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
@@ -472,29 +512,34 @@ static void scrcpy_source_tick(void *data, float seconds)
 		return;
 
 	context->restart_pending = false;
-	scrcpy_source_stop_session(context);
-	scrcpy_source_start_session(context);
+	if (scrcpy_source_is_in_use(context)) {
+		scrcpy_source_stop_session(context);
+		scrcpy_source_start_session(context);
+	}
 }
 
 static void scrcpy_source_activate(void *data)
 {
 	struct scrcpy_source *context = data;
-	if (!context)
-		return;
-
-	context->active = true;
-	scrcpy_source_start_session(context);
+	scrcpy_source_check_state(context);
 }
 
 static void scrcpy_source_deactivate(void *data)
 {
 	struct scrcpy_source *context = data;
-	if (!context)
-		return;
+	scrcpy_source_check_state(context);
+}
 
-	context->restart_pending = false;
-	context->active = false;
-	scrcpy_source_stop_session(context);
+static void scrcpy_source_show(void *data)
+{
+	struct scrcpy_source *context = data;
+	scrcpy_source_check_state(context);
+}
+
+static void scrcpy_source_hide(void *data)
+{
+	struct scrcpy_source *context = data;
+	scrcpy_source_check_state(context);
 }
 
 static int scrcpy_parse_adb_devices_from_string(const char *text, obs_property_t *list)
@@ -764,12 +809,15 @@ static struct obs_source_info scrcpy_source_info = {
 	.destroy = scrcpy_source_destroy,
 	.activate = scrcpy_source_activate,
 	.deactivate = scrcpy_source_deactivate,
+	.show = scrcpy_source_show,
+	.hide = scrcpy_source_hide,
 	.update = scrcpy_source_update,
 	.video_tick = scrcpy_source_tick,
 	.get_defaults = scrcpy_source_defaults,
 	.get_properties = scrcpy_source_properties,
 	.get_width = scrcpy_source_get_width,
 	.get_height = scrcpy_source_get_height,
+	.icon_type = OBS_ICON_TYPE_CAMERA,
 };
 
 void scrcpy_source_register(void)
