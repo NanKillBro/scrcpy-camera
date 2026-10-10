@@ -32,11 +32,16 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <limits.h>
 
 #define _TRUNCATE
 #define _snprintf_s(dest, size, _truncate, ...) snprintf((dest), (size), __VA_ARGS__)
 #define strtok_s strtok_r
 #define Sleep(ms) nanosleep(&(struct timespec){.tv_sec = (ms) / 1000, .tv_nsec = ((ms) % 1000) * 1000000L}, NULL)
+#endif
+
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
 #endif
 
 #define ADB_CMD_TIMEOUT_MS 3000
@@ -60,12 +65,158 @@
 #define SETTING_LOW_LATENCY "low_latency"
 
 #ifdef _WIN32
-static const char *const DEFAULT_ADB_PATH = "adb.exe";
 #define ADB_FILTER "Executable (*.exe);;All Files (*.*)"
+#define SERVER_JAR_FILTER "Jar Files (*.jar);;All Files (*.*)"
 #else
-static const char *const DEFAULT_ADB_PATH = "adb";
-#define ADB_FILTER "All Files (*.*)"
+#define ADB_FILTER "All Files (*)"
+#define SERVER_JAR_FILTER "Jar Files (*.jar);;All Files (*)"
 #endif
+
+static const char *scrcpy_get_default_adb_path(void)
+{
+#ifdef _WIN32
+	return "adb.exe";
+#elif defined(__APPLE__)
+	static char cached_path[PATH_MAX] = {0};
+	if (cached_path[0] && access(cached_path, X_OK) == 0)
+		return cached_path;
+
+	const char *candidates[6] = {NULL};
+	char env_home_path[PATH_MAX] = {0};
+	char env_root_path[PATH_MAX] = {0};
+	char home_sdk_path[PATH_MAX] = {0};
+	int count = 0;
+
+	/* 1. Android SDK from environment if set */
+	const char *android_home = getenv("ANDROID_HOME");
+	if (android_home && android_home[0]) {
+		snprintf(env_home_path, sizeof(env_home_path), "%s/platform-tools/adb", android_home);
+		candidates[count++] = env_home_path;
+	}
+
+	const char *android_root = getenv("ANDROID_SDK_ROOT");
+	if (android_root && android_root[0]) {
+		snprintf(env_root_path, sizeof(env_root_path), "%s/platform-tools/adb", android_root);
+		candidates[count++] = env_root_path;
+	}
+
+	/* 2. Standard Android Studio SDK location in user home */
+	const char *home = getenv("HOME");
+	if (home && home[0]) {
+		snprintf(home_sdk_path, sizeof(home_sdk_path), "%s/Library/Android/sdk/platform-tools/adb", home);
+		candidates[count++] = home_sdk_path;
+	}
+
+	/* 3. Apple Silicon & Intel Homebrew, MacPorts */
+	candidates[count++] = "/opt/homebrew/bin/adb";
+	candidates[count++] = "/usr/local/bin/adb";
+	candidates[count++] = "/opt/local/bin/adb";
+
+	for (int i = 0; i < count; i++) {
+		if (candidates[i] && access(candidates[i], X_OK) == 0) {
+			snprintf(cached_path, sizeof(cached_path), "%s", candidates[i]);
+			return cached_path;
+		}
+	}
+	return "adb";
+#else
+	return "adb";
+#endif
+}
+
+static const char *scrcpy_get_default_adb_dir(void)
+{
+#ifdef __APPLE__
+	const char *adb = scrcpy_get_default_adb_path();
+	if (adb && adb[0] == '/') {
+		static char cached_dir[PATH_MAX] = {0};
+		snprintf(cached_dir, sizeof(cached_dir), "%s", adb);
+		char *last_slash = strrchr(cached_dir, '/');
+		if (last_slash) {
+			*last_slash = '\0';
+			return cached_dir;
+		}
+	}
+	if (access("/opt/homebrew/bin", F_OK) == 0)
+		return "/opt/homebrew/bin";
+	if (access("/usr/local/bin", F_OK) == 0)
+		return "/usr/local/bin";
+#endif
+	return NULL;
+}
+
+static char *scrcpy_get_default_server_jar_path(void)
+{
+	char *bundled = obs_module_file("scrcpy-server.jar");
+	if (bundled) {
+		if (access(bundled, F_OK) == 0)
+			return bundled;
+		bfree(bundled);
+	}
+	return bstrdup("scrcpy-server.jar");
+}
+
+#ifdef __APPLE__
+static char *scrcpy_resolve_macos_path(const char *path)
+{
+	if (!path || !path[0])
+		return NULL;
+
+	CFURLRef url =
+		CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault, (const UInt8 *)path, strlen(path), false);
+	if (!url)
+		return NULL;
+
+	Boolean is_alias = false;
+	CFBooleanRef is_alias_val = NULL;
+	if (CFURLCopyResourcePropertyForKey(url, kCFURLIsAliasFileKey, &is_alias_val, NULL) && is_alias_val) {
+		is_alias = CFBooleanGetValue(is_alias_val);
+		CFRelease(is_alias_val);
+	}
+
+	char *resolved = NULL;
+	if (is_alias) {
+		CFDataRef bookmark = CFURLCreateBookmarkDataFromFile(kCFAllocatorDefault, url, NULL);
+		if (bookmark) {
+			Boolean is_stale = false;
+			CFURLRef resolved_url = CFURLCreateByResolvingBookmarkData(kCFAllocatorDefault, bookmark,
+										   kCFBookmarkResolutionWithoutUIMask,
+										   NULL, NULL, &is_stale, NULL);
+			if (resolved_url) {
+				char buffer[PATH_MAX];
+				if (CFURLGetFileSystemRepresentation(resolved_url, true, (UInt8 *)buffer,
+								     sizeof(buffer))) {
+					resolved = bstrdup(buffer);
+				}
+				CFRelease(resolved_url);
+			}
+			CFRelease(bookmark);
+		}
+	}
+	CFRelease(url);
+	return resolved;
+}
+#endif
+
+static char *scrcpy_resolve_file_path(const char *path)
+{
+	if (!path || !path[0])
+		return NULL;
+
+#ifdef __APPLE__
+	char *resolved = scrcpy_resolve_macos_path(path);
+	if (resolved)
+		return resolved;
+#endif
+
+#ifndef _WIN32
+	char real_buf[PATH_MAX];
+	if (realpath(path, real_buf))
+		return bstrdup(real_buf);
+#endif
+
+	return bstrdup(path);
+}
 static const char *const DEFAULT_SCRCPY_VERSION = "4.0";
 
 struct scrcpy_source {
@@ -200,11 +351,15 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 	bfree(context->video_source);
 	bfree(context->camera_id);
 	bfree(context->camera_size);
+	bfree(context->audio_source);
 	bfree(context->audio_codec);
-	context->adb_path = bstrdup(adb_path && adb_path[0] ? adb_path : DEFAULT_ADB_PATH);
+	char *default_jar = scrcpy_get_default_server_jar_path();
+	const char *chosen_adb = adb_path && adb_path[0] ? adb_path : scrcpy_get_default_adb_path();
+	const char *chosen_jar = server_jar_path && server_jar_path[0] ? server_jar_path : default_jar;
+	context->adb_path = scrcpy_resolve_file_path(chosen_adb);
 	context->device_serial = bstrdup(device_serial ? device_serial : "");
-	context->server_jar_path =
-		bstrdup(server_jar_path && server_jar_path[0] ? server_jar_path : "scrcpy-server.jar");
+	context->server_jar_path = scrcpy_resolve_file_path(chosen_jar);
+	bfree(default_jar);
 	context->scrcpy_version =
 		bstrdup(scrcpy_version && scrcpy_version[0] ? scrcpy_version : DEFAULT_SCRCPY_VERSION);
 	context->video_codec = bstrdup(video_codec && video_codec[0] ? video_codec : "h264");
@@ -262,9 +417,11 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 
 static void scrcpy_source_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_string(settings, SETTING_ADB_PATH, DEFAULT_ADB_PATH);
+	char *default_jar = scrcpy_get_default_server_jar_path();
+	obs_data_set_default_string(settings, SETTING_ADB_PATH, scrcpy_get_default_adb_path());
 	obs_data_set_default_string(settings, SETTING_DEVICE_SERIAL, "");
-	obs_data_set_default_string(settings, SETTING_SERVER_JAR_PATH, "scrcpy-server.jar");
+	obs_data_set_default_string(settings, SETTING_SERVER_JAR_PATH, default_jar);
+	bfree(default_jar);
 	obs_data_set_default_string(settings, SETTING_SCRCPY_VERSION, DEFAULT_SCRCPY_VERSION);
 	obs_data_set_default_string(settings, SETTING_VIDEO_CODEC, "h264");
 	obs_data_set_default_int(settings, SETTING_LOCAL_PORT, 27183);
@@ -317,7 +474,8 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 	obs_property_t *cam_id_prop;
 
 	obs_properties_t *props = obs_properties_create();
-	obs_properties_add_path(props, SETTING_ADB_PATH, "ADB executable", OBS_PATH_FILE, ADB_FILTER, NULL);
+	obs_properties_add_path(props, SETTING_ADB_PATH, "ADB executable", OBS_PATH_FILE, ADB_FILTER,
+				scrcpy_get_default_adb_dir());
 
 	obs_property_t *device_list = obs_properties_add_list(props, SETTING_DEVICE_SERIAL, "ADB device",
 							      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -337,7 +495,7 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 	obs_properties_add_button2(props, "refresh_devices", "Refresh device list", scrcpy_refresh_button_clicked,
 				   context);
 	obs_properties_add_path(props, SETTING_SERVER_JAR_PATH, "scrcpy-server.jar path", OBS_PATH_FILE,
-				"Jar Files (*.jar);;All Files (*.*)", NULL);
+				SERVER_JAR_FILTER, NULL);
 	obs_properties_add_text(props, SETTING_SCRCPY_VERSION, "scrcpy protocol version", OBS_TEXT_DEFAULT);
 
 	vsource_list = obs_properties_add_list(props, SETTING_VIDEO_SOURCE, "Video source", OBS_COMBO_TYPE_LIST,
@@ -603,7 +761,7 @@ static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char 
 {
 	char command[1024];
 
-	_snprintf_s(command, sizeof(command), _TRUNCATE, "%s %s", adb_path, args);
+	_snprintf_s(command, sizeof(command), _TRUNCATE, "\"%s\" %s", adb_path, args);
 
 #ifdef _WIN32
 	STARTUPINFOA si;
@@ -747,7 +905,7 @@ static int scrcpy_discover_mdns_devices(const char *adb_path)
 
 static int scrcpy_refresh_device_list(struct scrcpy_source *context, obs_property_t *list)
 {
-	const char *adb_path = DEFAULT_ADB_PATH;
+	const char *adb_path = scrcpy_get_default_adb_path();
 	int found = 0;
 	char devices_output[4096];
 

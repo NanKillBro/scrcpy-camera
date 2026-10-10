@@ -64,7 +64,7 @@ function(set_target_properties_plugin target)
   list(FILTER target_ui_files INCLUDE REGEX ".+\\.(ui|qrc)")
   source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" PREFIX "UI Files" FILES ${target_ui_files})
 
-  install(TARGETS ${target} LIBRARY DESTINATION .)
+  install(TARGETS ${target} LIBRARY DESTINATION . BUNDLE DESTINATION .)
   install(FILES "$<TARGET_BUNDLE_DIR:${target}>.dsym" CONFIGURATIONS Release DESTINATION . OPTIONAL)
 
   configure_file(cmake/macos/resources/distribution.in "${CMAKE_CURRENT_BINARY_DIR}/distribution" @ONLY)

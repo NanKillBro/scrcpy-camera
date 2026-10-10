@@ -55,6 +55,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <spawn.h>
 
 #define INVALID_SOCKET (-1)
 #define SOCKET int
@@ -75,6 +76,11 @@
 #endif
 
 #define DEFAULT_SCRCPY_VERSION "4.0"
+#ifdef _WIN32
+#define DEFAULT_ADB_BINARY "adb.exe"
+#else
+#define DEFAULT_ADB_BINARY "adb"
+#endif
 #define SCRCPY_META_DEVICE_NAME_SIZE 64
 #define SCRCPY_SESSION_PACKET_SIZE 12
 #define SCRCPY_FRAME_HEADER_SIZE 12
@@ -182,7 +188,7 @@ static void scrcpy_copy_config(struct scrcpy_session *session, const struct scrc
 	bfree(session->audio_source);
 	bfree(session->audio_codec);
 
-	session->adb_path = bstrdup(config->adb_path ? config->adb_path : "adb.exe");
+	session->adb_path = bstrdup(config->adb_path ? config->adb_path : DEFAULT_ADB_BINARY);
 	session->device_serial = bstrdup(config->device_serial ? config->device_serial : "");
 	session->server_jar_path = bstrdup(config->server_jar_path ? config->server_jar_path : "scrcpy-server.jar");
 	session->scrcpy_version = bstrdup(config->scrcpy_version && config->scrcpy_version[0] ? config->scrcpy_version
@@ -298,40 +304,34 @@ void scrcpy_session_stop(struct scrcpy_session *session)
 	InterlockedExchange(&session->stop_requested, 1);
 	scrcpy_close_stream_handles(session);
 
-	if (session->audio_thread) {
-		WaitForSingleObject(session->audio_thread, INFINITE);
-		CloseHandle(session->audio_thread);
-		session->audio_thread = NULL;
+	HANDLE audio_th = (HANDLE)InterlockedExchangePointer((void **)&session->audio_thread, NULL);
+	if (audio_th) {
+		WaitForSingleObject(audio_th, INFINITE);
+		CloseHandle(audio_th);
 	}
 
-	if (!session->worker_thread) {
-		InterlockedExchange(&session->running, 0);
-		return;
+	HANDLE worker_th = (HANDLE)InterlockedExchangePointer((void **)&session->worker_thread, NULL);
+	if (worker_th) {
+		WaitForSingleObject(worker_th, INFINITE);
+		CloseHandle(worker_th);
+		obs_log(LOG_INFO, "scrcpy session worker stopped");
 	}
-
-	WaitForSingleObject(session->worker_thread, INFINITE);
-	CloseHandle(session->worker_thread);
-	session->worker_thread = NULL;
 	InterlockedExchange(&session->running, 0);
-	obs_log(LOG_INFO, "scrcpy session worker stopped");
 #else
 	__atomic_store_n(&session->stop_requested, 1, __ATOMIC_RELEASE);
 	scrcpy_close_stream_handles(session);
 
-	if (session->audio_thread) {
-		pthread_join(session->audio_thread, NULL);
-		session->audio_thread = 0;
+	pthread_t audio_th = __atomic_exchange_n(&session->audio_thread, (pthread_t)0, __ATOMIC_SEQ_CST);
+	if (audio_th) {
+		pthread_join(audio_th, NULL);
 	}
 
-	if (!session->worker_thread) {
-		__atomic_store_n(&session->running, 0, __ATOMIC_RELEASE);
-		return;
+	pthread_t worker_th = __atomic_exchange_n(&session->worker_thread, (pthread_t)0, __ATOMIC_SEQ_CST);
+	if (worker_th) {
+		pthread_join(worker_th, NULL);
+		obs_log(LOG_INFO, "scrcpy session worker stopped");
 	}
-
-	pthread_join(session->worker_thread, NULL);
-	session->worker_thread = 0;
 	__atomic_store_n(&session->running, 0, __ATOMIC_RELEASE);
-	obs_log(LOG_INFO, "scrcpy session worker stopped");
 #endif
 }
 
@@ -370,6 +370,7 @@ static void scrcpy_close_stream_handles(struct scrcpy_session *session)
 #else
 	if (session->server_pid > 0) {
 		kill(session->server_pid, SIGTERM);
+		kill(-session->server_pid, SIGTERM);
 		waitpid(session->server_pid, NULL, 0);
 		session->server_pid = 0;
 	}
@@ -555,24 +556,36 @@ done:
 	/* ---- POSIX implementation ---- */
 	obs_log(LOG_DEBUG, "scrcpy command line: %s", command_line);
 
-	if (wait_for_exit) {
-		pid_t pid = fork();
-		if (pid < 0) {
-			obs_log(LOG_ERROR, "failed to fork process for step '%s'", step);
-			return false;
-		}
+	posix_spawn_file_actions_t actions;
+	if (posix_spawn_file_actions_init(&actions) != 0) {
+		obs_log(LOG_ERROR, "failed to init spawn file actions for '%s'", step);
+		return false;
+	}
+	posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDWR, 0);
+	posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+	posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
 
-		if (pid == 0) {
-			int devnull = open("/dev/null", O_RDWR);
-			if (devnull >= 0) {
-				dup2(devnull, STDIN_FILENO);
-				dup2(devnull, STDOUT_FILENO);
-				dup2(devnull, STDERR_FILENO);
-				if (devnull > 2)
-					close(devnull);
-			}
-			execl("/bin/sh", "sh", "-c", command_line, (char *)NULL);
-			_exit(127);
+	posix_spawnattr_t attr;
+	if (posix_spawnattr_init(&attr) != 0) {
+		posix_spawn_file_actions_destroy(&actions);
+		obs_log(LOG_ERROR, "failed to init spawn attr for '%s'", step);
+		return false;
+	}
+
+	char exec_cmd[4096];
+	_snprintf_s(exec_cmd, sizeof(exec_cmd), _TRUNCATE, "exec %s", command_line);
+	char *const argv[] = {"sh", "-c", exec_cmd, NULL};
+	extern char **environ;
+
+	if (wait_for_exit) {
+		pid_t pid = 0;
+		int spawn_ret = posix_spawn(&pid, "/bin/sh", &actions, &attr, argv, environ);
+		posix_spawn_file_actions_destroy(&actions);
+		posix_spawnattr_destroy(&attr);
+
+		if (spawn_ret != 0) {
+			obs_log(LOG_ERROR, "failed to spawn process for step '%s': error %d", step, spawn_ret);
+			return false;
 		}
 
 		for (;;) {
@@ -609,28 +622,19 @@ done:
 			Sleep(20);
 		}
 	} else {
-		/* Fire-and-forget server launch: fork and let the child keep running
-		 * in the background. Track its PID so the stream can be torn down. */
-		pid_t pid = fork();
-		if (pid < 0) {
-			obs_log(LOG_ERROR, "failed to fork server for step '%s'", step);
-			return false;
-		}
+		/* Fire-and-forget server launch: setpgroup so process group can be signaled */
+		short flags = POSIX_SPAWN_SETPGROUP;
+		posix_spawnattr_setflags(&attr, flags);
+		posix_spawnattr_setpgroup(&attr, 0);
 
-		if (pid == 0) {
-			int devnull = open("/dev/null", O_WRONLY);
-			if (devnull < 0)
-				devnull = open("/dev/null", O_RDONLY);
-			if (devnull >= 0) {
-				dup2(devnull, STDOUT_FILENO);
-				dup2(devnull, STDERR_FILENO);
-				dup2(devnull, STDIN_FILENO);
-				if (devnull > 2)
-					close(devnull);
-			}
-			setsid();
-			execl("/bin/sh", "sh", "-c", command_line, (char *)NULL);
-			_exit(127);
+		pid_t pid = 0;
+		int spawn_ret = posix_spawn(&pid, "/bin/sh", &actions, &attr, argv, environ);
+		posix_spawn_file_actions_destroy(&actions);
+		posix_spawnattr_destroy(&attr);
+
+		if (spawn_ret != 0) {
+			obs_log(LOG_ERROR, "failed to spawn server for step '%s': error %d", step, spawn_ret);
+			return false;
 		}
 
 		session->server_pid = pid;
@@ -728,8 +732,8 @@ static bool scrcpy_open_video_socket(struct scrcpy_session *session)
 #else
 			{
 				struct timeval tv;
-				tv.tv_sec = 0;
-				tv.tv_usec = timeout_ms * 1000;
+				tv.tv_sec = timeout_ms / 1000;
+				tv.tv_usec = (timeout_ms % 1000) * 1000;
 				setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
 			}
 #endif
@@ -780,10 +784,16 @@ static bool scrcpy_read_exact(struct scrcpy_session *session, SOCKET sock, void 
 			return false;
 		}
 
+#ifdef _WIN32
 		if (last_error == WSAETIMEDOUT) {
 			// obs_log(LOG_INFO, "[DEBUG] scrcpy recv timed out, retrying... (remaining=%zu)", remaining); // Might spam too much
 			continue;
 		}
+#else
+		if (last_error == EAGAIN || last_error == EWOULDBLOCK || last_error == EINTR) {
+			continue;
+		}
+#endif
 
 		// obs_log(LOG_INFO, "[DEBUG] scrcpy recv failed: received=%d remaining=%zu error=%d", received, remaining, last_error);
 
@@ -995,6 +1005,14 @@ static enum AVPixelFormat scrcpy_get_hw_format(AVCodecContext *ctx, const enum A
 						obs_log(LOG_INFO, "HW surface format selected: %s", name);
 						return *p;
 					}
+#ifdef __APPLE__
+				} else if (session->hw_device_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX) {
+					if (*p == AV_PIX_FMT_VIDEOTOOLBOX || strcmp(name, "videotoolbox_vld") == 0 ||
+					    strcmp(name, "videotoolbox") == 0) {
+						obs_log(LOG_INFO, "HW surface format selected: %s", name);
+						return *p;
+					}
+#endif
 				}
 			}
 		}
@@ -1025,7 +1043,7 @@ static bool scrcpy_init_decoder(struct scrcpy_session *session, enum AVCodecID c
 	session->hw_device_type = AV_HWDEVICE_TYPE_NONE;
 
 	if (session->hw_decoding) {
-		const char *hw_types[] = {"cuda", "vaapi", "vdpau", "qsv", "d3d11va", "dxva2", NULL};
+		const char *hw_types[] = {"videotoolbox", "cuda", "vaapi", "vdpau", "qsv", "d3d11va", "dxva2", NULL};
 		enum AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_NONE;
 
 		for (int i = 0; hw_types[i]; i++) {
@@ -1132,7 +1150,8 @@ static bool scrcpy_output_decoded_frames(struct scrcpy_session *session, AVCodec
 		AVFrame *output_frame = frame;
 		bool used_sw_frame = false;
 
-		if (frame->format != AV_PIX_FMT_YUV420P && frame->hw_frames_ctx) {
+		if (frame->format != AV_PIX_FMT_YUV420P &&
+		    (frame->hw_frames_ctx || frame->format == AV_PIX_FMT_VIDEOTOOLBOX)) {
 			av_frame_unref(sw_frame);
 			if (av_hwframe_transfer_data(sw_frame, frame, 0) < 0) {
 				obs_log(LOG_ERROR, "scrcpy decode loop: failed to transfer hw frame to sw");
@@ -1507,8 +1526,8 @@ static bool scrcpy_open_audio_socket(struct scrcpy_session *session)
 #else
 			{
 				struct timeval tv;
-				tv.tv_sec = 0;
-				tv.tv_usec = timeout_ms * 1000;
+				tv.tv_sec = timeout_ms / 1000;
+				tv.tv_usec = (timeout_ms % 1000) * 1000;
 				setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
 			}
 #endif
@@ -1884,22 +1903,22 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 		width = 0;
 		height = 0;
 
-		snprintf(command, sizeof(command), "%s start-server", session->adb_path);
+		snprintf(command, sizeof(command), "\"%s\" start-server", session->adb_path);
 		if (!scrcpy_command_step(session, "Start ADB server", command))
 			goto cleanup_winsock;
 
-		snprintf(command, sizeof(command), "%s -s %s push \"%s\" /data/local/tmp/scrcpy-server.jar",
+		snprintf(command, sizeof(command), "\"%s\" -s \"%s\" push \"%s\" /data/local/tmp/scrcpy-server.jar",
 			 session->adb_path, session->device_serial, session->server_jar_path);
 		if (!scrcpy_command_step(session, "Push scrcpy server", command))
 			goto cleanup_winsock;
 
-		snprintf(command, sizeof(command), "%s -s %s forward tcp:%hu localabstract:%s", session->adb_path,
-			 session->device_serial, session->local_port, session->socket_name);
+		snprintf(command, sizeof(command), "\"%s\" -s \"%s\" forward tcp:%hu localabstract:%s",
+			 session->adb_path, session->device_serial, session->local_port, session->socket_name);
 		if (!scrcpy_command_step(session, "Configure adb forward", command))
 			goto cleanup_winsock;
 
 		snprintf(command, sizeof(command),
-			 "%s -s %s shell CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / "
+			 "\"%s\" -s \"%s\" shell CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / "
 			 "com.genymobile.scrcpy.Server %s scid=%08x tunnel_forward=true audio=%s control=false "
 			 "video_codec=%s",
 			 session->adb_path, session->device_serial, session->scrcpy_version, session->scid,
@@ -2074,20 +2093,25 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 		if (decoder_context)
 			avcodec_free_context(&decoder_context);
 
-		/* Wait for audio thread to finish before closing handles */
-		if (session->audio_thread) {
-#ifdef _WIN32
-			WaitForSingleObject(session->audio_thread, 5000);
-			CloseHandle(session->audio_thread);
-#else
-			pthread_join(session->audio_thread, NULL);
-#endif
-			session->audio_thread = 0;
-		}
-
+		/* Close sockets first so audio thread's recv() unblocks immediately */
 		scrcpy_close_stream_handles(session);
 
-		_snprintf_s(command, sizeof(command), _TRUNCATE, "\"%s\" -s %s forward --remove tcp:%hu",
+		/* Wait for audio thread to finish if not already joined by session_stop */
+#ifdef _WIN32
+		HANDLE cleanup_audio_th = (HANDLE)InterlockedExchangePointer((void **)&session->audio_thread, NULL);
+		if (cleanup_audio_th) {
+			WaitForSingleObject(cleanup_audio_th, 5000);
+			CloseHandle(cleanup_audio_th);
+		}
+#else
+		pthread_t cleanup_audio_th =
+			__atomic_exchange_n(&session->audio_thread, (pthread_t)0, __ATOMIC_SEQ_CST);
+		if (cleanup_audio_th) {
+			pthread_join(cleanup_audio_th, NULL);
+		}
+#endif
+
+		_snprintf_s(command, sizeof(command), _TRUNCATE, "\"%s\" -s \"%s\" forward --remove tcp:%hu",
 			    session->adb_path, session->device_serial, session->local_port);
 		if (!scrcpy_run_process(session, "Remove adb forward", command, true, true, NULL)) {
 			obs_log(LOG_INFO, "adb forward removal is optional during cleanup for tcp:%hu",
