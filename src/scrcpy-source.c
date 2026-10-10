@@ -30,6 +30,7 @@
 #else
 #include <stdio.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <limits.h>
@@ -245,6 +246,30 @@ struct scrcpy_source {
 	bool active;
 	bool restart_pending;
 	uint64_t restart_after_ns;
+
+	/*
+	 * Status shown in the properties banner. Written by the session worker
+	 * thread via scrcpy_source_on_status, read by the OBS UI thread when it
+	 * builds the properties, hence the lock.
+	 */
+	struct scrcpy_status status;
+#ifdef _WIN32
+	CRITICAL_SECTION status_lock;
+#else
+	pthread_mutex_t status_lock;
+#endif
+	/*
+	 * Last text handed to the UI, plus when. A properties refresh rebuilds every
+	 * widget in the dialog and drops keyboard focus, so it must only happen when
+	 * the text actually changed, and not too often.
+	 */
+	char rendered_status[SCRCPY_STATUS_TEXT_SIZE];
+	bool status_dirty;
+	uint64_t last_refresh_ns;
+	/* Last state actually written to the log, so a session stuck in a retry loop
+	 * reports its cause once instead of on every cycle. */
+	enum scrcpy_status_problem last_logged_problem;
+	enum scrcpy_status_phase last_logged_phase;
 };
 
 static void scrcpy_source_update(void *data, obs_data_t *settings);
@@ -255,6 +280,9 @@ static void scrcpy_source_tick(void *data, float seconds);
 static void scrcpy_source_stop_session(struct scrcpy_source *context);
 static void scrcpy_source_on_frame(void *opaque, const struct obs_source_frame *frame);
 static void scrcpy_source_on_audio(void *opaque, const struct obs_source_audio *audio);
+static void scrcpy_source_on_status(void *opaque, const struct scrcpy_status *status);
+static void scrcpy_source_copy_status_text(struct scrcpy_source *context, char *dest, size_t dest_size);
+static enum scrcpy_status_severity scrcpy_source_status_severity(struct scrcpy_source *context);
 static bool scrcpy_source_is_in_use(struct scrcpy_source *context);
 static void scrcpy_source_check_state(struct scrcpy_source *context);
 static void scrcpy_source_show(void *data);
@@ -289,6 +317,13 @@ static void *scrcpy_source_create(obs_data_t *settings, obs_source_t *source)
 	context->session = scrcpy_session_create();
 	context->frame_width = 0;
 	context->frame_height = 0;
+#ifdef _WIN32
+	InitializeCriticalSection(&context->status_lock);
+#else
+	pthread_mutex_init(&context->status_lock, NULL);
+#endif
+	/* Render the idle banner up front so the properties panel is never blank. */
+	scrcpy_status_format(&context->status, context->rendered_status, sizeof(context->rendered_status));
 
 	obs_log(LOG_INFO, "creating scrcpy source scaffold");
 	scrcpy_source_update(context, settings);
@@ -316,7 +351,14 @@ static void scrcpy_source_destroy(void *data)
 	bfree(context->camera_size);
 	bfree(context->audio_source);
 	bfree(context->audio_codec);
+	/* Destroy the session first: its worker thread is joined there, so no status
+	 * callback can still be in flight when the lock goes away. */
 	scrcpy_session_destroy(context->session);
+#ifdef _WIN32
+	DeleteCriticalSection(&context->status_lock);
+#else
+	pthread_mutex_destroy(&context->status_lock);
+#endif
 	bfree(context);
 }
 
@@ -474,6 +516,39 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 	obs_property_t *cam_id_prop;
 
 	obs_properties_t *props = obs_properties_create();
+
+	/*
+	 * Live status banner, first so it is the first thing seen on opening the
+	 * dialog.
+	 *
+	 * The text is passed as the property *description*, not as a settings value:
+	 * OBS renders OBS_TEXT_INFO by reading obs_data_get_string(settings, name)
+	 * and, when that is empty, falls back to the description and drops the
+	 * left-hand label, giving a full-width banner. Keeping it out of settings
+	 * also means status never dirties the scene collection or gets saved to disk.
+	 */
+	if (context) {
+		char status_text[SCRCPY_STATUS_TEXT_SIZE];
+		obs_property_t *status_prop;
+
+		scrcpy_source_copy_status_text(context, status_text, sizeof(status_text));
+		status_prop = obs_properties_add_text(props, "scrcpy_status", status_text, OBS_TEXT_INFO);
+		if (status_prop) {
+			switch (scrcpy_source_status_severity(context)) {
+			case SCRCPY_SEVERITY_WARNING:
+				obs_property_text_set_info_type(status_prop, OBS_TEXT_INFO_WARNING);
+				break;
+			case SCRCPY_SEVERITY_ERROR:
+				obs_property_text_set_info_type(status_prop, OBS_TEXT_INFO_ERROR);
+				break;
+			case SCRCPY_SEVERITY_INFO:
+				obs_property_text_set_info_type(status_prop, OBS_TEXT_INFO_NORMAL);
+				break;
+			}
+			obs_property_text_set_info_word_wrap(status_prop, true);
+		}
+	}
+
 	obs_properties_add_path(props, SETTING_ADB_PATH, "ADB executable", OBS_PATH_FILE, ADB_FILTER,
 				scrcpy_get_default_adb_dir());
 
@@ -598,9 +673,113 @@ static void scrcpy_source_start_session(struct scrcpy_source *context)
 	config.on_frame_opaque = context;
 	config.on_audio = scrcpy_source_on_audio;
 	config.on_audio_opaque = context;
+	config.on_status = scrcpy_source_on_status;
+	config.on_status_opaque = context;
 
-	if (scrcpy_session_start(context->session, &config) != 0)
-		obs_log(LOG_WARNING, "unable to start scrcpy bootstrap session");
+	/* -2 just means no device is picked yet, which the status banner already
+	 * explains; it is not a warning worth shouting about in the log. */
+	int start_ret = scrcpy_session_start(context->session, &config);
+	if (start_ret != 0 && start_ret != -2)
+		obs_log(LOG_WARNING, "unable to start scrcpy bootstrap session (%d)", start_ret);
+}
+
+static void scrcpy_source_lock_status(struct scrcpy_source *context)
+{
+#ifdef _WIN32
+	EnterCriticalSection(&context->status_lock);
+#else
+	pthread_mutex_lock(&context->status_lock);
+#endif
+}
+
+static void scrcpy_source_unlock_status(struct scrcpy_source *context)
+{
+#ifdef _WIN32
+	LeaveCriticalSection(&context->status_lock);
+#else
+	pthread_mutex_unlock(&context->status_lock);
+#endif
+}
+
+/*
+ * Receives status from the session worker thread.
+ *
+ * Only records it here; the actual UI refresh is flushed from the video tick.
+ * Refreshing makes OBS tear down and rebuild every widget in the properties
+ * dialog (ReloadProperties -> RefreshProperties), which loses keyboard focus, so
+ * it has to be both change-gated and rate-limited. Doing the flush in the tick
+ * also means a refresh that gets rate-limited is retried rather than lost.
+ */
+static void scrcpy_source_on_status(void *opaque, const struct scrcpy_status *status)
+{
+	struct scrcpy_source *context = opaque;
+	char rendered[SCRCPY_STATUS_TEXT_SIZE];
+
+	if (!context || !status)
+		return;
+
+	scrcpy_status_format(status, rendered, sizeof(rendered));
+
+	/*
+	 * Also decide here what, if anything, to log. Deliberately not every
+	 * transition: a session retrying a dead device walks the same phases every
+	 * couple of seconds, so log a problem once per distinct cause, plus the
+	 * states worth a line on their own. Mirroring it means a support request
+	 * carrying only the OBS log still shows what the user saw in the banner.
+	 *
+	 * The decision is made under the lock because this callback arrives from the
+	 * session worker thread and, for the no-device case, from the OBS thread.
+	 */
+	bool notable_phase = status->phase == SCRCPY_PHASE_STREAMING || status->phase == SCRCPY_PHASE_NO_DEVICE ||
+			     status->phase == SCRCPY_PHASE_FAILED;
+	bool log_problem = false;
+	bool log_phase = false;
+
+	scrcpy_source_lock_status(context);
+	context->status = *status;
+	if (strcmp(context->rendered_status, rendered) != 0) {
+		snprintf(context->rendered_status, sizeof(context->rendered_status), "%s", rendered);
+		context->status_dirty = true;
+	}
+
+	if (status->problem != SCRCPY_PROBLEM_NONE && status->problem != context->last_logged_problem) {
+		context->last_logged_problem = status->problem;
+		context->last_logged_phase = status->phase;
+		log_problem = true;
+	} else if (notable_phase && status->phase != context->last_logged_phase) {
+		context->last_logged_phase = status->phase;
+		/* A healthy stream means any earlier cause is resolved; allow it to be
+		 * reported again if it comes back. */
+		if (status->phase == SCRCPY_PHASE_STREAMING)
+			context->last_logged_problem = SCRCPY_PROBLEM_NONE;
+		log_phase = true;
+	}
+	scrcpy_source_unlock_status(context);
+
+	if (log_problem)
+		obs_log(LOG_WARNING, "status [%s]: %s - %s", obs_source_get_name(context->source),
+			scrcpy_status_phase_label(status->phase), scrcpy_status_problem_title(status->problem));
+	else if (log_phase)
+		obs_log(LOG_INFO, "status [%s]: %s", obs_source_get_name(context->source),
+			scrcpy_status_phase_label(status->phase));
+}
+
+/* Copies the current banner text out for the UI thread. */
+static void scrcpy_source_copy_status_text(struct scrcpy_source *context, char *dest, size_t dest_size)
+{
+	scrcpy_source_lock_status(context);
+	snprintf(dest, dest_size, "%s", context->rendered_status);
+	scrcpy_source_unlock_status(context);
+}
+
+static enum scrcpy_status_severity scrcpy_source_status_severity(struct scrcpy_source *context)
+{
+	enum scrcpy_status_severity severity;
+
+	scrcpy_source_lock_status(context);
+	severity = scrcpy_status_severity(&context->status);
+	scrcpy_source_unlock_status(context);
+	return severity;
 }
 
 static void scrcpy_source_stop_session(struct scrcpy_source *context)
@@ -663,7 +842,29 @@ static void scrcpy_source_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
 	struct scrcpy_source *context = data;
-	if (!context || !context->restart_pending)
+	if (!context)
+		return;
+
+	/*
+	 * Push a pending status change to the properties dialog. Rate-limited
+	 * because each refresh rebuilds the whole dialog; the dirty flag means a
+	 * skipped refresh is retried on a later tick instead of being lost.
+	 */
+	uint64_t now_ns = os_gettime_ns();
+	bool refresh = false;
+
+	scrcpy_source_lock_status(context);
+	if (context->status_dirty && (!context->last_refresh_ns || now_ns - context->last_refresh_ns >= 500000000ULL)) {
+		context->status_dirty = false;
+		context->last_refresh_ns = now_ns;
+		refresh = true;
+	}
+	scrcpy_source_unlock_status(context);
+
+	if (refresh)
+		obs_source_update_properties(context->source);
+
+	if (!context->restart_pending)
 		return;
 
 	if (os_gettime_ns() < context->restart_after_ns)
@@ -736,11 +937,39 @@ static int scrcpy_parse_adb_devices_from_string(const char *text, obs_property_t
 		if (!serial || !state)
 			continue;
 
-		if (strcmp(state, "device") != 0)
+		if (strcmp(state, "device") == 0) {
+			obs_property_list_add_string(list, serial, serial);
+			++found;
 			continue;
+		}
 
-		obs_property_list_add_string(list, serial, serial);
-		++found;
+		/*
+		 * Anything not in the "device" state used to be dropped silently, so a
+		 * phone that was plugged in but unauthorized produced "No online ADB
+		 * devices" and no hint that the cable was fine. Keep these rows, with
+		 * the reason, and an empty value so they cannot be selected.
+		 */
+		char label[256];
+		const char *hint = "";
+
+		if (strcmp(state, "unauthorized") == 0)
+			hint = " \xE2\x80\x94 unauthorized: tap \"Allow USB debugging\" on the device";
+		else if (strcmp(state, "authorizing") == 0)
+			hint = " \xE2\x80\x94 still authorizing, wait a moment";
+		else if (strcmp(state, "offline") == 0)
+			hint = " \xE2\x80\x94 offline: unplug and replug the device";
+		else if (strcmp(state, "no") == 0) /* "no permissions" splits on the space */
+			hint = " \xE2\x80\x94 no permissions: check your udev rules";
+		else if (strcmp(state, "recovery") == 0 || strcmp(state, "sideload") == 0 ||
+			 strcmp(state, "bootloader") == 0)
+			hint = " \xE2\x80\x94 not booted into Android";
+
+		if (hint[0])
+			_snprintf_s(label, sizeof(label), _TRUNCATE, "%s%s", serial, hint);
+		else
+			_snprintf_s(label, sizeof(label), _TRUNCATE, "%s \xE2\x80\x94 %s", serial, state);
+
+		obs_property_list_add_string(list, label, "");
 	}
 
 	return found;

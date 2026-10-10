@@ -21,6 +21,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "scrcpy-status.h"
+
 struct scrcpy_session;
 struct obs_source_frame;
 struct obs_source_audio;
@@ -53,6 +55,10 @@ struct scrcpy_session_config {
 	void *on_frame_opaque;
 	scrcpy_session_audio_callback on_audio;
 	void *on_audio_opaque;
+	/* Called from the worker thread whenever the session's phase, problem or
+	 * stream parameters change. Never called once scrcpy_session_stop returns. */
+	scrcpy_session_status_callback on_status;
+	void *on_status_opaque;
 };
 
 struct scrcpy_session *scrcpy_session_create(void);
