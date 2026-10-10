@@ -55,6 +55,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <spawn.h>
 
 #define INVALID_SOCKET (-1)
 #define SOCKET int
@@ -75,6 +76,11 @@
 #endif
 
 #define DEFAULT_SCRCPY_VERSION "4.0"
+#ifdef _WIN32
+#define DEFAULT_ADB_BINARY "adb.exe"
+#else
+#define DEFAULT_ADB_BINARY "adb"
+#endif
 #define SCRCPY_META_DEVICE_NAME_SIZE 64
 #define SCRCPY_SESSION_PACKET_SIZE 12
 #define SCRCPY_FRAME_HEADER_SIZE 12
@@ -124,13 +130,43 @@ struct scrcpy_session {
 	void *on_frame_opaque;
 	scrcpy_session_audio_callback on_audio;
 	void *on_audio_opaque;
+	scrcpy_session_status_callback on_status;
+	void *on_status_opaque;
 	uint64_t next_audio_ts;
 	char socket_name[64];
+
+	/*
+	 * Status reported to the UI. Only the worker thread writes it, and it is
+	 * pushed out through on_status whenever it changes, so no lock is needed
+	 * here; the source makes its own guarded copy.
+	 */
+	struct scrcpy_status status;
+
+	/*
+	 * Tail of the most recent child process stderr. adb and the scrcpy server
+	 * both report their real reasons here, and both are quiet on success, so
+	 * keeping only the tail is enough to classify a failure.
+	 *
+	 * Written by the worker thread for short commands and by the server log
+	 * thread for the long-lived server, hence the lock.
+	 */
+	char last_stderr[SCRCPY_STATUS_DETAIL_SIZE];
+#ifdef _WIN32
+	CRITICAL_SECTION stderr_lock;
+	/* Set by the audio thread, picked up by the video decode loop, which is the
+	 * only thread allowed to touch `status`. */
+	volatile LONG audio_problem;
+#else
+	pthread_mutex_t stderr_lock;
+	volatile int audio_problem;
+#endif
 
 #ifdef _WIN32
 	HANDLE worker_thread;
 	HANDLE audio_thread;
 	HANDLE server_process;
+	HANDLE server_log_thread;
+	HANDLE server_stderr_read;
 	SOCKET video_socket;
 	SOCKET audio_socket;
 	volatile LONG stop_requested;
@@ -138,6 +174,9 @@ struct scrcpy_session {
 #else
 	pthread_t worker_thread;
 	pthread_t audio_thread;
+	pthread_t server_log_thread;
+	bool server_log_thread_valid;
+	int server_stderr_read;
 	pid_t server_pid;
 	int video_socket;
 	int audio_socket;
@@ -148,6 +187,7 @@ struct scrcpy_session {
 
 static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque);
 static SCRCPY_THREAD_API scrcpy_audio_worker(void *opaque);
+static SCRCPY_THREAD_API scrcpy_server_log_worker(void *opaque);
 static bool scrcpy_command_step(struct scrcpy_session *session, const char *step, const char *command_line);
 static bool scrcpy_command_fire_and_forget(struct scrcpy_session *session, const char *step, const char *command_line);
 static bool scrcpy_run_process(struct scrcpy_session *session, const char *step, const char *command_line,
@@ -168,6 +208,241 @@ static bool scrcpy_decode_loop(struct scrcpy_session *session, AVCodecContext *d
 			       uint32_t height);
 static bool scrcpy_audio_decode_loop(struct scrcpy_session *session, AVCodecContext *decoder_context, bool is_raw_pcm);
 static void scrcpy_close_stream_handles(struct scrcpy_session *session);
+static void scrcpy_record_stderr(struct scrcpy_session *session, const char *text);
+static void scrcpy_copy_stderr(struct scrcpy_session *session, char *dest, size_t dest_size);
+static void scrcpy_clear_stderr(struct scrcpy_session *session);
+static enum scrcpy_status_problem scrcpy_classify_failure(struct scrcpy_session *session, const char *step,
+							  int exit_code);
+static void scrcpy_publish_status(struct scrcpy_session *session);
+static void scrcpy_report_phase(struct scrcpy_session *session, enum scrcpy_status_phase phase);
+static void scrcpy_report_problem(struct scrcpy_session *session, enum scrcpy_status_problem problem,
+				  const char *detail);
+
+/*
+ * Audio runs on its own thread but only the video worker may write `status`, so
+ * the audio side parks its problem here and the decode loop picks it up.
+ */
+static void scrcpy_set_audio_problem(struct scrcpy_session *session, enum scrcpy_status_problem problem)
+{
+	if (!session)
+		return;
+#ifdef _WIN32
+	InterlockedExchange(&session->audio_problem, (LONG)problem);
+#else
+	__atomic_store_n(&session->audio_problem, (int)problem, __ATOMIC_RELEASE);
+#endif
+}
+
+static enum scrcpy_status_problem scrcpy_get_audio_problem(struct scrcpy_session *session)
+{
+	if (!session)
+		return SCRCPY_PROBLEM_NONE;
+#ifdef _WIN32
+	return (enum scrcpy_status_problem)InterlockedCompareExchange(&session->audio_problem, 0, 0);
+#else
+	return (enum scrcpy_status_problem)__atomic_load_n(&session->audio_problem, __ATOMIC_ACQUIRE);
+#endif
+}
+
+/*
+ * Status reporting
+ *
+ * Every obs_log of a failure in this file has a matching report here, so the
+ * properties banner never says less than the log does. Only the worker thread
+ * calls these.
+ */
+
+static void scrcpy_publish_status(struct scrcpy_session *session)
+{
+	if (session && session->on_status)
+		session->on_status(session->on_status_opaque, &session->status);
+}
+
+static void scrcpy_report_phase(struct scrcpy_session *session, enum scrcpy_status_phase phase)
+{
+	if (!session)
+		return;
+
+	session->status.phase = phase;
+	/* Entering a new phase clears the previous failure, so a successful retry
+	 * does not keep showing a stale error. */
+	session->status.problem = SCRCPY_PROBLEM_NONE;
+	session->status.detail[0] = '\0';
+	scrcpy_publish_status(session);
+}
+
+static void scrcpy_report_problem(struct scrcpy_session *session, enum scrcpy_status_problem problem,
+				  const char *detail)
+{
+	if (!session)
+		return;
+
+	session->status.problem = problem;
+	if (detail && detail[0]) {
+		snprintf(session->status.detail, sizeof(session->status.detail), "%s", detail);
+	} else {
+		/* Fall back to whatever the child last printed; it is usually the
+		 * most specific thing available. */
+		scrcpy_copy_stderr(session, session->status.detail, sizeof(session->status.detail));
+	}
+	scrcpy_publish_status(session);
+}
+
+static void scrcpy_lock_stderr(struct scrcpy_session *session)
+{
+#ifdef _WIN32
+	EnterCriticalSection(&session->stderr_lock);
+#else
+	pthread_mutex_lock(&session->stderr_lock);
+#endif
+}
+
+static void scrcpy_unlock_stderr(struct scrcpy_session *session)
+{
+#ifdef _WIN32
+	LeaveCriticalSection(&session->stderr_lock);
+#else
+	pthread_mutex_unlock(&session->stderr_lock);
+#endif
+}
+
+/*
+ * Keeps the tail of a child's stderr. Called with whatever chunk was readable,
+ * which may be a partial line, so it appends and slides rather than replacing.
+ */
+static void scrcpy_record_stderr(struct scrcpy_session *session, const char *text)
+{
+	if (!session || !text || !text[0])
+		return;
+
+	scrcpy_lock_stderr(session);
+
+	size_t existing = strlen(session->last_stderr);
+	size_t incoming = strlen(text);
+	size_t capacity = sizeof(session->last_stderr) - 1;
+
+	if (incoming >= capacity) {
+		/* Keep the newest bytes: the final error line matters, not the preamble. */
+		memcpy(session->last_stderr, text + (incoming - capacity), capacity);
+		session->last_stderr[capacity] = '\0';
+		scrcpy_unlock_stderr(session);
+		return;
+	}
+
+	if (existing + incoming > capacity) {
+		size_t drop = existing + incoming - capacity;
+		memmove(session->last_stderr, session->last_stderr + drop, existing - drop + 1);
+		existing -= drop;
+	}
+
+	memcpy(session->last_stderr + existing, text, incoming);
+	session->last_stderr[existing + incoming] = '\0';
+
+	scrcpy_unlock_stderr(session);
+}
+
+static void scrcpy_copy_stderr(struct scrcpy_session *session, char *dest, size_t dest_size)
+{
+	if (!session || !dest || dest_size == 0)
+		return;
+
+	scrcpy_lock_stderr(session);
+	snprintf(dest, dest_size, "%s", session->last_stderr);
+	scrcpy_unlock_stderr(session);
+
+	/* Child output ends in a newline. Internal ones are kept (the server's camera
+	 * list is multi-line and worth showing), but a trailing one would add a blank
+	 * line to every log entry and a gap at the end of the banner. */
+	size_t len = strlen(dest);
+	while (len > 0 &&
+	       (dest[len - 1] == '\n' || dest[len - 1] == '\r' || dest[len - 1] == ' ' || dest[len - 1] == '\t'))
+		dest[--len] = '\0';
+}
+
+static void scrcpy_clear_stderr(struct scrcpy_session *session)
+{
+	if (!session)
+		return;
+
+	scrcpy_lock_stderr(session);
+	session->last_stderr[0] = '\0';
+	scrcpy_unlock_stderr(session);
+}
+
+/*
+ * Maps the captured output of a failed step onto an actionable cause.
+ *
+ * The adb strings are what the real binary prints (all on stderr, exit 1). The
+ * "[server] ERROR:" strings come from the scrcpy v4.0 server, which routes every
+ * error through Ln.e() with that prefix.
+ *
+ * The scrcpy server's own checks are tested first because they are the most
+ * specific, and because the buffer also carries its "[server] INFO:" chatter
+ * (stdout and stderr share one pipe) which a looser pattern could match by
+ * accident. Each adb pattern is anchored on text only adb produces.
+ */
+static enum scrcpy_status_problem scrcpy_classify_failure(struct scrcpy_session *session, const char *step,
+							  int exit_code)
+{
+	char buffer[SCRCPY_STATUS_DETAIL_SIZE];
+	const char *out = buffer;
+
+	buffer[0] = '\0';
+	if (session)
+		scrcpy_copy_stderr(session, buffer, sizeof(buffer));
+
+	/* /bin/sh and CreateProcess both report a missing binary this way. */
+	if (exit_code == 127)
+		return SCRCPY_PROBLEM_ADB_NOT_FOUND;
+
+	if (!out[0]) {
+		if (step && strstr(step, "Push"))
+			return SCRCPY_PROBLEM_JAR_MISSING;
+		return SCRCPY_PROBLEM_UNKNOWN;
+	}
+
+	/* scrcpy server, most specific first. */
+	if (strstr(out, "does not match the client"))
+		return SCRCPY_PROBLEM_VERSION_MISMATCH;
+	if (strstr(out, "Camera id not found") || strstr(out, "Camera with id") ||
+	    strstr(out, "No matching camera found"))
+		return SCRCPY_PROBLEM_CAMERA_ID_INVALID;
+	if (strstr(out, "Camera configuration error"))
+		return SCRCPY_PROBLEM_CAMERA_CONFIG;
+	if (strstr(out, "Camera mirroring is not supported"))
+		return SCRCPY_PROBLEM_CAMERA_UNSUPPORTED;
+	if (strstr(out, "Audio capture failed") || strstr(out, "requires Android"))
+		return SCRCPY_PROBLEM_AUDIO_UNSUPPORTED;
+
+	/* adb. "' not found" is the tail of adb's "device '<serial>' not found". */
+	if (strstr(out, "' not found"))
+		return SCRCPY_PROBLEM_DEVICE_NOT_FOUND;
+	if (strstr(out, "device unauthorized") || strstr(out, "device is unauthorized"))
+		return SCRCPY_PROBLEM_DEVICE_UNAUTHORIZED;
+	if (strstr(out, "still authorizing"))
+		return SCRCPY_PROBLEM_DEVICE_AUTHORIZING;
+	if (strstr(out, "device offline"))
+		return SCRCPY_PROBLEM_DEVICE_OFFLINE;
+	if (strstr(out, "no devices/emulators found"))
+		return SCRCPY_PROBLEM_NO_DEVICES;
+	if (strstr(out, "more than one device"))
+		return SCRCPY_PROBLEM_NO_DEVICES;
+	if (strstr(out, "cannot bind listener"))
+		return SCRCPY_PROBLEM_PORT_IN_USE;
+	if (strstr(out, "not a valid executable") || strstr(out, "No such file or directory") ||
+	    strstr(out, "cannot stat")) {
+		/* On the push step this is the jar; anywhere else it is adb itself. */
+		if (step && strstr(step, "Push"))
+			return SCRCPY_PROBLEM_JAR_MISSING;
+		return SCRCPY_PROBLEM_ADB_NOT_FOUND;
+	}
+
+	/* Anything else the server reported, including uncaught exceptions. */
+	if (strstr(out, "ClassNotFoundException") || strstr(out, "[server] ERROR:"))
+		return SCRCPY_PROBLEM_SERVER_CRASH;
+
+	return SCRCPY_PROBLEM_UNKNOWN;
+}
 
 static void scrcpy_copy_config(struct scrcpy_session *session, const struct scrcpy_session_config *config)
 {
@@ -182,7 +457,7 @@ static void scrcpy_copy_config(struct scrcpy_session *session, const struct scrc
 	bfree(session->audio_source);
 	bfree(session->audio_codec);
 
-	session->adb_path = bstrdup(config->adb_path ? config->adb_path : "adb.exe");
+	session->adb_path = bstrdup(config->adb_path ? config->adb_path : DEFAULT_ADB_BINARY);
 	session->device_serial = bstrdup(config->device_serial ? config->device_serial : "");
 	session->server_jar_path = bstrdup(config->server_jar_path ? config->server_jar_path : "scrcpy-server.jar");
 	session->scrcpy_version = bstrdup(config->scrcpy_version && config->scrcpy_version[0] ? config->scrcpy_version
@@ -208,12 +483,30 @@ static void scrcpy_copy_config(struct scrcpy_session *session, const struct scrc
 	session->on_frame_opaque = config->on_frame_opaque;
 	session->on_audio = config->on_audio;
 	session->on_audio_opaque = config->on_audio_opaque;
+	session->on_status = config->on_status;
+	session->on_status_opaque = config->on_status_opaque;
 	snprintf(session->socket_name, sizeof(session->socket_name), "scrcpy_%08x", session->scid);
+
+	/* A restart must not inherit the previous run's failure. */
+	memset(&session->status, 0, sizeof(session->status));
+	scrcpy_clear_stderr(session);
+	scrcpy_set_audio_problem(session, SCRCPY_PROBLEM_NONE);
+	snprintf(session->status.codec, sizeof(session->status.codec), "%s", session->video_codec);
+	session->status.hw_decode = session->hw_decoding;
+	session->status.audio_active = false;
 }
 
 struct scrcpy_session *scrcpy_session_create(void)
 {
-	return bzalloc(sizeof(struct scrcpy_session));
+	struct scrcpy_session *session = bzalloc(sizeof(struct scrcpy_session));
+
+#ifdef _WIN32
+	InitializeCriticalSection(&session->stderr_lock);
+#else
+	pthread_mutex_init(&session->stderr_lock, NULL);
+	session->server_stderr_read = -1;
+#endif
+	return session;
 }
 
 void scrcpy_session_destroy(struct scrcpy_session *session)
@@ -233,6 +526,11 @@ void scrcpy_session_destroy(struct scrcpy_session *session)
 	bfree(session->camera_size);
 	bfree(session->audio_source);
 	bfree(session->audio_codec);
+#ifdef _WIN32
+	DeleteCriticalSection(&session->stderr_lock);
+#else
+	pthread_mutex_destroy(&session->stderr_lock);
+#endif
 	bfree(session);
 }
 
@@ -254,6 +552,16 @@ int scrcpy_session_start(struct scrcpy_session *session, const struct scrcpy_ses
 
 	if (!config->device_serial || !config->device_serial[0]) {
 		obs_log(LOG_WARNING, "scrcpy session start skipped: no device serial selected");
+		/*
+		 * Report through the caller's callback rather than the session's own,
+		 * which is only wired up by scrcpy_copy_config further down.
+		 */
+		if (config->on_status) {
+			struct scrcpy_status status;
+			memset(&status, 0, sizeof(status));
+			status.phase = SCRCPY_PHASE_NO_DEVICE;
+			config->on_status(config->on_status_opaque, &status);
+		}
 		return -2;
 	}
 
@@ -298,40 +606,34 @@ void scrcpy_session_stop(struct scrcpy_session *session)
 	InterlockedExchange(&session->stop_requested, 1);
 	scrcpy_close_stream_handles(session);
 
-	if (session->audio_thread) {
-		WaitForSingleObject(session->audio_thread, INFINITE);
-		CloseHandle(session->audio_thread);
-		session->audio_thread = NULL;
+	HANDLE audio_th = (HANDLE)InterlockedExchangePointer((void **)&session->audio_thread, NULL);
+	if (audio_th) {
+		WaitForSingleObject(audio_th, INFINITE);
+		CloseHandle(audio_th);
 	}
 
-	if (!session->worker_thread) {
-		InterlockedExchange(&session->running, 0);
-		return;
+	HANDLE worker_th = (HANDLE)InterlockedExchangePointer((void **)&session->worker_thread, NULL);
+	if (worker_th) {
+		WaitForSingleObject(worker_th, INFINITE);
+		CloseHandle(worker_th);
+		obs_log(LOG_INFO, "scrcpy session worker stopped");
 	}
-
-	WaitForSingleObject(session->worker_thread, INFINITE);
-	CloseHandle(session->worker_thread);
-	session->worker_thread = NULL;
 	InterlockedExchange(&session->running, 0);
-	obs_log(LOG_INFO, "scrcpy session worker stopped");
 #else
 	__atomic_store_n(&session->stop_requested, 1, __ATOMIC_RELEASE);
 	scrcpy_close_stream_handles(session);
 
-	if (session->audio_thread) {
-		pthread_join(session->audio_thread, NULL);
-		session->audio_thread = 0;
+	pthread_t audio_th = __atomic_exchange_n(&session->audio_thread, (pthread_t)0, __ATOMIC_SEQ_CST);
+	if (audio_th) {
+		pthread_join(audio_th, NULL);
 	}
 
-	if (!session->worker_thread) {
-		__atomic_store_n(&session->running, 0, __ATOMIC_RELEASE);
-		return;
+	pthread_t worker_th = __atomic_exchange_n(&session->worker_thread, (pthread_t)0, __ATOMIC_SEQ_CST);
+	if (worker_th) {
+		pthread_join(worker_th, NULL);
+		obs_log(LOG_INFO, "scrcpy session worker stopped");
 	}
-
-	pthread_join(session->worker_thread, NULL);
-	session->worker_thread = 0;
 	__atomic_store_n(&session->running, 0, __ATOMIC_RELEASE);
-	obs_log(LOG_INFO, "scrcpy session worker stopped");
 #endif
 }
 
@@ -370,10 +672,111 @@ static void scrcpy_close_stream_handles(struct scrcpy_session *session)
 #else
 	if (session->server_pid > 0) {
 		kill(session->server_pid, SIGTERM);
+		kill(-session->server_pid, SIGTERM);
 		waitpid(session->server_pid, NULL, 0);
 		session->server_pid = 0;
 	}
 #endif
+
+	/*
+	 * The server is gone, so its stderr pipe is at EOF and the reader thread is
+	 * about to return. Join it before dropping the handle so it can never read
+	 * from a closed descriptor.
+	 *
+	 * This function runs from both the worker thread (per-iteration cleanup) and
+	 * the UI thread (scrcpy_session_stop), so claim the handle atomically to
+	 * avoid joining the same thread twice. Same pattern PR #9 uses for the audio
+	 * and worker threads.
+	 */
+#ifdef _WIN32
+	HANDLE log_th = (HANDLE)InterlockedExchangePointer((void **)&session->server_log_thread, NULL);
+	if (log_th) {
+		WaitForSingleObject(log_th, 2000);
+		CloseHandle(log_th);
+	}
+
+	HANDLE log_pipe = (HANDLE)InterlockedExchangePointer((void **)&session->server_stderr_read, NULL);
+	if (log_pipe)
+		CloseHandle(log_pipe);
+#else
+	if (__atomic_exchange_n(&session->server_log_thread_valid, false, __ATOMIC_SEQ_CST)) {
+		pthread_join(session->server_log_thread, NULL);
+
+		int log_fd = __atomic_exchange_n(&session->server_stderr_read, -1, __ATOMIC_SEQ_CST);
+		if (log_fd >= 0)
+			close(log_fd);
+	}
+#endif
+}
+
+/*
+ * Reads the scrcpy server's stderr for the life of the session.
+ *
+ * Everything the server reports goes here prefixed "[server] ERROR:" or
+ * "[server] WARN:", and the useful ones arrive at two very different times:
+ * configuration errors during startup, and events like "Camera disconnected"
+ * much later. A dedicated reader catches both; the worker thread classifies
+ * whatever is in the buffer when a step fails.
+ */
+static SCRCPY_THREAD_API scrcpy_server_log_worker(void *opaque)
+{
+	struct scrcpy_session *session = opaque;
+	char chunk[512];
+
+	if (!session)
+		return 0;
+
+#ifdef _WIN32
+	HANDLE pipe_handle = session->server_stderr_read;
+
+	while (pipe_handle && !scrcpy_should_stop(session)) {
+		DWORD available = 0;
+		DWORD bytes_read = 0;
+
+		if (!PeekNamedPipe(pipe_handle, NULL, 0, NULL, &available, NULL))
+			break; /* server exited and closed its end */
+
+		if (available == 0) {
+			Sleep(100);
+			continue;
+		}
+
+		DWORD to_read = (DWORD)sizeof(chunk) - 1;
+		if (to_read > available)
+			to_read = available;
+
+		if (!ReadFile(pipe_handle, chunk, to_read, &bytes_read, NULL) || bytes_read == 0)
+			break;
+
+		chunk[bytes_read] = '\0';
+		scrcpy_record_stderr(session, chunk);
+		obs_log(LOG_INFO, "scrcpy server: %s", chunk);
+	}
+#else
+	int fd = session->server_stderr_read;
+
+	while (fd >= 0 && !scrcpy_should_stop(session)) {
+		ssize_t n = read(fd, chunk, sizeof(chunk) - 1);
+
+		if (n > 0) {
+			chunk[n] = '\0';
+			scrcpy_record_stderr(session, chunk);
+			obs_log(LOG_INFO, "scrcpy server: %s", chunk);
+			continue;
+		}
+
+		if (n == 0)
+			break; /* server exited and closed its end */
+
+		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+			Sleep(100);
+			continue;
+		}
+		break;
+	}
+#endif
+
+	return 0;
 }
 
 static bool scrcpy_command_step(struct scrcpy_session *session, const char *step, const char *command)
@@ -451,6 +854,38 @@ static bool scrcpy_run_process(struct scrcpy_session *session, const char *step,
 		startup_info.hStdOutput = stdout_write;
 		startup_info.hStdError = stderr_write;
 		startup_info.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+		scrcpy_clear_stderr(session);
+	} else {
+		/*
+		 * The server launch previously discarded its output on Windows too,
+		 * which is where every scrcpy-side error is reported. Give it a stderr
+		 * pipe and let the log reader thread own the read end.
+		 */
+		SECURITY_ATTRIBUTES security_attributes;
+
+		ZeroMemory(&security_attributes, sizeof(security_attributes));
+		security_attributes.nLength = sizeof(security_attributes);
+		security_attributes.bInheritHandle = TRUE;
+		security_attributes.lpSecurityDescriptor = NULL;
+
+		if (CreatePipe(&stderr_read, &stderr_write, &security_attributes, 0) &&
+		    SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0)) {
+			startup_info.dwFlags |= STARTF_USESTDHANDLES;
+			startup_info.hStdOutput = stderr_write;
+			startup_info.hStdError = stderr_write;
+			startup_info.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+		} else {
+			obs_log(LOG_WARNING, "failed to create server stderr pipe, diagnostics will be limited");
+			if (stderr_read) {
+				CloseHandle(stderr_read);
+				stderr_read = NULL;
+			}
+			if (stderr_write) {
+				CloseHandle(stderr_write);
+				stderr_write = NULL;
+			}
+		}
 	}
 	ZeroMemory(&process_info, sizeof(process_info));
 
@@ -476,6 +911,7 @@ static bool scrcpy_run_process(struct scrcpy_session *session, const char *step,
 				if (ReadFile(stdout_read, buffer, sizeof(buffer) - 1, &bytes_read, NULL) &&
 				    bytes_read > 0) {
 					buffer[bytes_read] = '\0';
+					scrcpy_record_stderr(session, buffer);
 					obs_log(LOG_INFO, "scrcpy adb: %s", buffer);
 				}
 			}
@@ -487,6 +923,7 @@ static bool scrcpy_run_process(struct scrcpy_session *session, const char *step,
 				if (ReadFile(stderr_read, buffer, sizeof(buffer) - 1, &bytes_read, NULL) &&
 				    bytes_read > 0) {
 					buffer[bytes_read] = '\0';
+					scrcpy_record_stderr(session, buffer);
 					obs_log(LOG_INFO, "scrcpy adb: %s", buffer);
 				}
 			}
@@ -517,6 +954,25 @@ static bool scrcpy_run_process(struct scrcpy_session *session, const char *step,
 		session->server_process = process_info.hProcess;
 		process_info.hProcess = NULL;
 		success = true;
+
+		/*
+		 * Hand the read end to the log reader thread, which owns it until the
+		 * session tears down. Clearing stderr_read here keeps the cleanup block
+		 * below from closing it out from under the thread.
+		 */
+		if (stderr_read) {
+			session->server_stderr_read = stderr_read;
+			stderr_read = NULL;
+
+			uintptr_t log_handle = _beginthreadex(NULL, 0, scrcpy_server_log_worker, session, 0, NULL);
+			if (log_handle) {
+				session->server_log_thread = (HANDLE)log_handle;
+			} else {
+				obs_log(LOG_WARNING, "failed to start scrcpy server log reader");
+				CloseHandle(session->server_stderr_read);
+				session->server_stderr_read = NULL;
+			}
+		}
 	}
 
 done:
@@ -555,29 +1011,89 @@ done:
 	/* ---- POSIX implementation ---- */
 	obs_log(LOG_DEBUG, "scrcpy command line: %s", command_line);
 
+	posix_spawn_file_actions_t actions;
+	if (posix_spawn_file_actions_init(&actions) != 0) {
+		obs_log(LOG_ERROR, "failed to init spawn file actions for '%s'", step);
+		return false;
+	}
+
+	/*
+	 * Capture the child's stdout and stderr instead of discarding them. adb and
+	 * the scrcpy server report every real reason for a failure here, and without
+	 * this the plugin can only ever say "it did not work".
+	 *
+	 * pipe() + fcntl() rather than pipe2(): pipe2 is Linux-only and this branch
+	 * is also the macOS build.
+	 */
+	int out_pipe[2] = {-1, -1};
+	bool have_pipe = pipe(out_pipe) == 0;
+
+	if (have_pipe) {
+		fcntl(out_pipe[0], F_SETFD, FD_CLOEXEC);
+		fcntl(out_pipe[0], F_SETFL, O_NONBLOCK);
+		posix_spawn_file_actions_adddup2(&actions, out_pipe[1], STDOUT_FILENO);
+		posix_spawn_file_actions_adddup2(&actions, out_pipe[1], STDERR_FILENO);
+		posix_spawn_file_actions_addclose(&actions, out_pipe[0]);
+		posix_spawn_file_actions_addclose(&actions, out_pipe[1]);
+	} else {
+		obs_log(LOG_WARNING, "failed to create output pipe for step '%s', diagnostics will be limited", step);
+		posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+		posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+	}
+	posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDWR, 0);
+
+	posix_spawnattr_t attr;
+	if (posix_spawnattr_init(&attr) != 0) {
+		posix_spawn_file_actions_destroy(&actions);
+		if (have_pipe) {
+			close(out_pipe[0]);
+			close(out_pipe[1]);
+		}
+		obs_log(LOG_ERROR, "failed to init spawn attr for '%s'", step);
+		return false;
+	}
+
+	char exec_cmd[4096];
+	_snprintf_s(exec_cmd, sizeof(exec_cmd), _TRUNCATE, "exec %s", command_line);
+	char *const argv[] = {"sh", "-c", exec_cmd, NULL};
+	extern char **environ;
+
 	if (wait_for_exit) {
-		pid_t pid = fork();
-		if (pid < 0) {
-			obs_log(LOG_ERROR, "failed to fork process for step '%s'", step);
+		pid_t pid = 0;
+		int spawn_ret = posix_spawn(&pid, "/bin/sh", &actions, &attr, argv, environ);
+		posix_spawn_file_actions_destroy(&actions);
+		posix_spawnattr_destroy(&attr);
+
+		/* The write end must be closed here or the read end never sees EOF. */
+		if (have_pipe) {
+			close(out_pipe[1]);
+			out_pipe[1] = -1;
+		}
+
+		if (spawn_ret != 0) {
+			if (have_pipe)
+				close(out_pipe[0]);
+			obs_log(LOG_ERROR, "failed to spawn process for step '%s': error %d", step, spawn_ret);
 			return false;
 		}
 
-		if (pid == 0) {
-			int devnull = open("/dev/null", O_RDWR);
-			if (devnull >= 0) {
-				dup2(devnull, STDIN_FILENO);
-				dup2(devnull, STDOUT_FILENO);
-				dup2(devnull, STDERR_FILENO);
-				if (devnull > 2)
-					close(devnull);
-			}
-			execl("/bin/sh", "sh", "-c", command_line, (char *)NULL);
-			_exit(127);
-		}
+		scrcpy_clear_stderr(session);
 
 		for (;;) {
 			int status = 0;
 			pid_t r = waitpid(pid, &status, WNOHANG);
+
+			/* Drain whatever is readable on every pass, so a chatty child
+			 * cannot fill the pipe buffer and block itself. */
+			if (have_pipe) {
+				char chunk[512];
+				ssize_t n;
+				while ((n = read(out_pipe[0], chunk, sizeof(chunk) - 1)) > 0) {
+					chunk[n] = '\0';
+					scrcpy_record_stderr(session, chunk);
+				}
+			}
+
 			if (r == pid) {
 				if (WIFEXITED(status))
 					process_exit_code = WEXITSTATUS(status);
@@ -608,32 +1124,62 @@ done:
 			}
 			Sleep(20);
 		}
+
+		/* The child may have exited with output still sitting in the pipe. */
+		if (have_pipe) {
+			char chunk[512];
+			ssize_t n;
+			while ((n = read(out_pipe[0], chunk, sizeof(chunk) - 1)) > 0) {
+				chunk[n] = '\0';
+				scrcpy_record_stderr(session, chunk);
+			}
+			close(out_pipe[0]);
+		}
+
+		char tail[SCRCPY_STATUS_DETAIL_SIZE];
+		scrcpy_copy_stderr(session, tail, sizeof(tail));
+		if (tail[0])
+			obs_log(LOG_INFO, "scrcpy adb [%s]: %s", step, tail);
 	} else {
-		/* Fire-and-forget server launch: fork and let the child keep running
-		 * in the background. Track its PID so the stream can be torn down. */
-		pid_t pid = fork();
-		if (pid < 0) {
-			obs_log(LOG_ERROR, "failed to fork server for step '%s'", step);
+		/* Fire-and-forget server launch: setpgroup so process group can be signaled */
+		short flags = POSIX_SPAWN_SETPGROUP;
+		posix_spawnattr_setflags(&attr, flags);
+		posix_spawnattr_setpgroup(&attr, 0);
+
+		pid_t pid = 0;
+		int spawn_ret = posix_spawn(&pid, "/bin/sh", &actions, &attr, argv, environ);
+		posix_spawn_file_actions_destroy(&actions);
+		posix_spawnattr_destroy(&attr);
+
+		if (have_pipe) {
+			close(out_pipe[1]);
+			out_pipe[1] = -1;
+		}
+
+		if (spawn_ret != 0) {
+			if (have_pipe)
+				close(out_pipe[0]);
+			obs_log(LOG_ERROR, "failed to spawn server for step '%s': error %d", step, spawn_ret);
 			return false;
 		}
 
-		if (pid == 0) {
-			int devnull = open("/dev/null", O_WRONLY);
-			if (devnull < 0)
-				devnull = open("/dev/null", O_RDONLY);
-			if (devnull >= 0) {
-				dup2(devnull, STDOUT_FILENO);
-				dup2(devnull, STDERR_FILENO);
-				dup2(devnull, STDIN_FILENO);
-				if (devnull > 2)
-					close(devnull);
+		/*
+		 * The server runs for the whole session and reports errors like
+		 * "Camera disconnected" long after startup, so hand its output to a
+		 * reader thread rather than polling it from here.
+		 */
+		session->server_pid = pid;
+		if (have_pipe) {
+			session->server_stderr_read = out_pipe[0];
+			if (pthread_create(&session->server_log_thread, NULL, scrcpy_server_log_worker, session) == 0) {
+				session->server_log_thread_valid = true;
+			} else {
+				obs_log(LOG_WARNING, "failed to start scrcpy server log reader");
+				close(session->server_stderr_read);
+				session->server_stderr_read = -1;
 			}
-			setsid();
-			execl("/bin/sh", "sh", "-c", command_line, (char *)NULL);
-			_exit(127);
 		}
 
-		session->server_pid = pid;
 		success = true;
 		obs_log(LOG_DEBUG, "scrcpy fire-and-forget launched (pid %ld) in %.3f sec: %s", (long)pid,
 			(double)(os_gettime_ns() - start_ns) / 1e9, step);
@@ -728,8 +1274,8 @@ static bool scrcpy_open_video_socket(struct scrcpy_session *session)
 #else
 			{
 				struct timeval tv;
-				tv.tv_sec = 0;
-				tv.tv_usec = timeout_ms * 1000;
+				tv.tv_sec = timeout_ms / 1000;
+				tv.tv_usec = (timeout_ms % 1000) * 1000;
 				setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
 			}
 #endif
@@ -780,10 +1326,16 @@ static bool scrcpy_read_exact(struct scrcpy_session *session, SOCKET sock, void 
 			return false;
 		}
 
+#ifdef _WIN32
 		if (last_error == WSAETIMEDOUT) {
 			// obs_log(LOG_INFO, "[DEBUG] scrcpy recv timed out, retrying... (remaining=%zu)", remaining); // Might spam too much
 			continue;
 		}
+#else
+		if (last_error == EAGAIN || last_error == EWOULDBLOCK || last_error == EINTR) {
+			continue;
+		}
+#endif
 
 		// obs_log(LOG_INFO, "[DEBUG] scrcpy recv failed: received=%d remaining=%zu error=%d", received, remaining, last_error);
 
@@ -908,6 +1460,9 @@ static bool scrcpy_read_handshake(struct scrcpy_session *session, enum AVCodecID
 		}
 	}
 	obs_log(LOG_INFO, "scrcpy device metadata: '%s'", device_name);
+	/* The device model is the one piece of the banner that confirms the user is
+	 * looking at the phone they think they are. */
+	snprintf(session->status.device_name, sizeof(session->status.device_name), "%s", device_name);
 
 	if (!scrcpy_read_exact(session, session->video_socket, codec_bytes, sizeof(codec_bytes))) {
 		scrcpy_log_socket_available("codec id read failed", session->video_socket);
@@ -918,9 +1473,11 @@ static bool scrcpy_read_handshake(struct scrcpy_session *session, enum AVCodecID
 	codec = scrcpy_read_be32(codec_bytes);
 	if (codec == 0x68323634U) {
 		*codec_id = AV_CODEC_ID_H264;
+		snprintf(session->status.codec, sizeof(session->status.codec), "H.264");
 		obs_log(LOG_INFO, "scrcpy codec id: h264");
 	} else if (codec == 0x68323635U) {
 		*codec_id = AV_CODEC_ID_HEVC;
+		snprintf(session->status.codec, sizeof(session->status.codec), "H.265");
 		obs_log(LOG_INFO, "scrcpy codec id: h265");
 	} else {
 		obs_log(LOG_ERROR, "unsupported scrcpy codec id: 0x%08x", codec);
@@ -995,6 +1552,14 @@ static enum AVPixelFormat scrcpy_get_hw_format(AVCodecContext *ctx, const enum A
 						obs_log(LOG_INFO, "HW surface format selected: %s", name);
 						return *p;
 					}
+#ifdef __APPLE__
+				} else if (session->hw_device_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX) {
+					if (*p == AV_PIX_FMT_VIDEOTOOLBOX || strcmp(name, "videotoolbox_vld") == 0 ||
+					    strcmp(name, "videotoolbox") == 0) {
+						obs_log(LOG_INFO, "HW surface format selected: %s", name);
+						return *p;
+					}
+#endif
 				}
 			}
 		}
@@ -1025,7 +1590,7 @@ static bool scrcpy_init_decoder(struct scrcpy_session *session, enum AVCodecID c
 	session->hw_device_type = AV_HWDEVICE_TYPE_NONE;
 
 	if (session->hw_decoding) {
-		const char *hw_types[] = {"cuda", "vaapi", "vdpau", "qsv", "d3d11va", "dxva2", NULL};
+		const char *hw_types[] = {"videotoolbox", "cuda", "vaapi", "vdpau", "qsv", "d3d11va", "dxva2", NULL};
 		enum AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_NONE;
 
 		for (int i = 0; hw_types[i]; i++) {
@@ -1036,6 +1601,9 @@ static bool scrcpy_init_decoder(struct scrcpy_session *session, enum AVCodecID c
 					obs_log(LOG_INFO, "hardware decoding context created successfully: %s",
 						hw_types[i]);
 					session->hw_device_type = hw_type;
+					snprintf(session->status.hw_name, sizeof(session->status.hw_name), "%s",
+						 hw_types[i]);
+					session->status.hw_decode = true;
 					break;
 				}
 			}
@@ -1043,6 +1611,10 @@ static bool scrcpy_init_decoder(struct scrcpy_session *session, enum AVCodecID c
 
 		if (!hw_device_ctx) {
 			obs_log(LOG_WARNING, "failed to create any hardware device context, falling back to software");
+			/* Say "software" in the banner rather than claiming hardware the
+			 * user is not actually getting. */
+			session->status.hw_decode = false;
+			session->status.hw_name[0] = '\0';
 		}
 	}
 
@@ -1132,7 +1704,8 @@ static bool scrcpy_output_decoded_frames(struct scrcpy_session *session, AVCodec
 		AVFrame *output_frame = frame;
 		bool used_sw_frame = false;
 
-		if (frame->format != AV_PIX_FMT_YUV420P && frame->hw_frames_ctx) {
+		if (frame->format != AV_PIX_FMT_YUV420P &&
+		    (frame->hw_frames_ctx || frame->format == AV_PIX_FMT_VIDEOTOOLBOX)) {
 			av_frame_unref(sw_frame);
 			if (av_hwframe_transfer_data(sw_frame, frame, 0) < 0) {
 				obs_log(LOG_ERROR, "scrcpy decode loop: failed to transfer hw frame to sw");
@@ -1256,6 +1829,12 @@ static bool scrcpy_decode_loop(struct scrcpy_session *session, AVCodecContext *d
 			width = scrcpy_read_be32(header + 4);
 			height = scrcpy_read_be32(header + 8);
 			obs_log(LOG_INFO, "scrcpy session refresh: %ux%u", width, height);
+			/* Device rotated or changed mode; keep the banner's resolution honest. */
+			if (session->status.width != width || session->status.height != height) {
+				session->status.width = width;
+				session->status.height = height;
+				scrcpy_publish_status(session);
+			}
 			continue;
 		}
 
@@ -1282,6 +1861,18 @@ static bool scrcpy_decode_loop(struct scrcpy_session *session, AVCodecContext *d
 				(unsigned long long)session->catch_up_events);
 			session->age_max_ns = 0;
 			session->last_stats_ns = now_ns;
+		}
+
+		/*
+		 * Pick up anything the audio thread parked for us. Checked on the stats
+		 * cadence rather than per packet, since it can only change once.
+		 */
+		enum scrcpy_status_problem audio_problem = scrcpy_get_audio_problem(session);
+		if (audio_problem != session->status.audio_problem) {
+			session->status.audio_problem = audio_problem;
+			if (audio_problem != SCRCPY_PROBLEM_NONE)
+				session->status.audio_active = false;
+			scrcpy_publish_status(session);
 		}
 
 		payload_size = scrcpy_read_be32(header + 8);
@@ -1507,8 +2098,8 @@ static bool scrcpy_open_audio_socket(struct scrcpy_session *session)
 #else
 			{
 				struct timeval tv;
-				tv.tv_sec = 0;
-				tv.tv_usec = timeout_ms * 1000;
+				tv.tv_sec = timeout_ms / 1000;
+				tv.tv_usec = (timeout_ms % 1000) * 1000;
 				setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
 			}
 #endif
@@ -1554,6 +2145,7 @@ static bool scrcpy_read_audio_handshake(struct scrcpy_session *session, enum AVC
 		obs_log(LOG_INFO, "scrcpy audio codec: flac");
 	} else {
 		obs_log(LOG_ERROR, "unsupported scrcpy audio codec id: 0x%08x", codec);
+		scrcpy_set_audio_problem(session, SCRCPY_PROBLEM_AUDIO_CODEC);
 		return false;
 	}
 
@@ -1820,6 +2412,7 @@ static SCRCPY_THREAD_API scrcpy_audio_worker(void *opaque)
 		const AVCodec *codec = avcodec_find_decoder(audio_codec_id);
 		if (!codec) {
 			obs_log(LOG_ERROR, "ffmpeg audio decoder not found for codec id %d", (int)audio_codec_id);
+			scrcpy_set_audio_problem(session, SCRCPY_PROBLEM_AUDIO_CODEC);
 			return 0;
 		}
 
@@ -1833,6 +2426,7 @@ static SCRCPY_THREAD_API scrcpy_audio_worker(void *opaque)
 
 		if (avcodec_open2(audio_decoder, codec, NULL) < 0) {
 			obs_log(LOG_ERROR, "failed to open audio decoder");
+			scrcpy_set_audio_problem(session, SCRCPY_PROBLEM_AUDIO_CODEC);
 			avcodec_free_context(&audio_decoder);
 			return 0;
 		}
@@ -1884,22 +2478,32 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 		width = 0;
 		height = 0;
 
-		snprintf(command, sizeof(command), "%s start-server", session->adb_path);
-		if (!scrcpy_command_step(session, "Start ADB server", command))
+		snprintf(command, sizeof(command), "\"%s\" start-server", session->adb_path);
+		scrcpy_report_phase(session, SCRCPY_PHASE_ADB_SERVER);
+		if (!scrcpy_command_step(session, "Start ADB server", command)) {
+			scrcpy_report_problem(session, scrcpy_classify_failure(session, "Start ADB server", 0), NULL);
 			goto cleanup_winsock;
+		}
 
-		snprintf(command, sizeof(command), "%s -s %s push \"%s\" /data/local/tmp/scrcpy-server.jar",
+		snprintf(command, sizeof(command), "\"%s\" -s \"%s\" push \"%s\" /data/local/tmp/scrcpy-server.jar",
 			 session->adb_path, session->device_serial, session->server_jar_path);
-		if (!scrcpy_command_step(session, "Push scrcpy server", command))
+		scrcpy_report_phase(session, SCRCPY_PHASE_PUSH_SERVER);
+		if (!scrcpy_command_step(session, "Push scrcpy server", command)) {
+			scrcpy_report_problem(session, scrcpy_classify_failure(session, "Push scrcpy server", 0), NULL);
 			goto cleanup_winsock;
+		}
 
-		snprintf(command, sizeof(command), "%s -s %s forward tcp:%hu localabstract:%s", session->adb_path,
-			 session->device_serial, session->local_port, session->socket_name);
-		if (!scrcpy_command_step(session, "Configure adb forward", command))
+		snprintf(command, sizeof(command), "\"%s\" -s \"%s\" forward tcp:%hu localabstract:%s",
+			 session->adb_path, session->device_serial, session->local_port, session->socket_name);
+		scrcpy_report_phase(session, SCRCPY_PHASE_FORWARD);
+		if (!scrcpy_command_step(session, "Configure adb forward", command)) {
+			scrcpy_report_problem(session, scrcpy_classify_failure(session, "Configure adb forward", 0),
+					      NULL);
 			goto cleanup_winsock;
+		}
 
 		snprintf(command, sizeof(command),
-			 "%s -s %s shell CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / "
+			 "\"%s\" -s \"%s\" shell CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / "
 			 "com.genymobile.scrcpy.Server %s scid=%08x tunnel_forward=true audio=%s control=false "
 			 "video_codec=%s",
 			 session->adb_path, session->device_serial, session->scrcpy_version, session->scid,
@@ -1961,8 +2565,12 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 
 		obs_log(LOG_INFO, "scrcpy server command: ...%s",
 			strlen(command) > 80 ? command + strlen(command) - 80 : command);
-		if (!scrcpy_command_fire_and_forget(session, "Start scrcpy app_process server", command))
+		scrcpy_report_phase(session, SCRCPY_PHASE_LAUNCH_SERVER);
+		if (!scrcpy_command_fire_and_forget(session, "Start scrcpy app_process server", command)) {
+			scrcpy_report_problem(
+				session, scrcpy_classify_failure(session, "Start scrcpy app_process server", 0), NULL);
 			goto cleanup_winsock;
+		}
 
 		/*
 	 * The scrcpy server takes some time to start on the device after
@@ -1983,9 +2591,15 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 				max_attempts = 25;
 			}
 
+			session->status.max_attempts = max_attempts;
+			scrcpy_report_phase(session, SCRCPY_PHASE_HANDSHAKE);
+
 			for (connect_attempt = 0; connect_attempt < max_attempts; ++connect_attempt) {
 				if (scrcpy_should_stop(session))
 					goto cleanup_winsock;
+
+				session->status.attempt = connect_attempt + 1;
+				scrcpy_publish_status(session);
 
 				if (!scrcpy_open_video_socket(session))
 					goto cleanup_winsock;
@@ -2031,12 +2645,24 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 			}
 			if (!handshake_ok) {
 				obs_log(LOG_ERROR, "scrcpy handshake failed after %d attempts", connect_attempt);
+				/*
+				 * By now the server log reader has usually captured the real
+				 * reason (bad camera id, version mismatch, ...). Only fall back
+				 * to the generic "never started streaming" if it said nothing.
+				 */
+				enum scrcpy_status_problem problem = scrcpy_classify_failure(session, "Handshake", 0);
+				if (problem == SCRCPY_PROBLEM_UNKNOWN)
+					problem = SCRCPY_PROBLEM_SERVER_SILENT;
+				scrcpy_report_problem(session, problem, NULL);
 				goto cleanup_winsock;
 			}
 		}
 
-		if (!scrcpy_init_decoder(session, codec_id, &decoder_context))
+		scrcpy_report_phase(session, SCRCPY_PHASE_DECODER_INIT);
+		if (!scrcpy_init_decoder(session, codec_id, &decoder_context)) {
+			scrcpy_report_problem(session, SCRCPY_PROBLEM_DECODER_MISSING, NULL);
 			goto cleanup_winsock;
+		}
 
 		/*
 	 * Audio socket is already connected. Start the audio worker on a separate thread
@@ -2048,6 +2674,7 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 				uintptr_t audio_handle = _beginthreadex(NULL, 0, scrcpy_audio_worker, session, 0, NULL);
 				if (audio_handle) {
 					session->audio_thread = (HANDLE)audio_handle;
+					session->status.audio_active = true;
 					obs_log(LOG_INFO, "scrcpy audio worker thread started");
 				} else {
 					obs_log(LOG_WARNING, "failed to start audio worker thread");
@@ -2056,6 +2683,7 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 				int audio_rc =
 					pthread_create(&session->audio_thread, NULL, scrcpy_audio_worker, session);
 				if (audio_rc == 0) {
+					session->status.audio_active = true;
 					obs_log(LOG_INFO, "scrcpy audio worker thread started");
 				} else {
 					obs_log(LOG_WARNING, "failed to start audio worker thread");
@@ -2063,6 +2691,13 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 #endif
 			}
 		}
+
+		/* Frames are about to flow: this is the one transition into STREAMING,
+		 * reported once rather than per frame. */
+		session->status.width = width;
+		session->status.height = height;
+		session->status.reconnect_count = 0;
+		scrcpy_report_phase(session, SCRCPY_PHASE_STREAMING);
 
 		if (!scrcpy_decode_loop(session, decoder_context, width, height))
 			obs_log(LOG_WARNING, "scrcpy decode loop exited due to stream error or decode failure");
@@ -2074,20 +2709,25 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 		if (decoder_context)
 			avcodec_free_context(&decoder_context);
 
-		/* Wait for audio thread to finish before closing handles */
-		if (session->audio_thread) {
-#ifdef _WIN32
-			WaitForSingleObject(session->audio_thread, 5000);
-			CloseHandle(session->audio_thread);
-#else
-			pthread_join(session->audio_thread, NULL);
-#endif
-			session->audio_thread = 0;
-		}
-
+		/* Close sockets first so audio thread's recv() unblocks immediately */
 		scrcpy_close_stream_handles(session);
 
-		_snprintf_s(command, sizeof(command), _TRUNCATE, "\"%s\" -s %s forward --remove tcp:%hu",
+		/* Wait for audio thread to finish if not already joined by session_stop */
+#ifdef _WIN32
+		HANDLE cleanup_audio_th = (HANDLE)InterlockedExchangePointer((void **)&session->audio_thread, NULL);
+		if (cleanup_audio_th) {
+			WaitForSingleObject(cleanup_audio_th, 5000);
+			CloseHandle(cleanup_audio_th);
+		}
+#else
+		pthread_t cleanup_audio_th =
+			__atomic_exchange_n(&session->audio_thread, (pthread_t)0, __ATOMIC_SEQ_CST);
+		if (cleanup_audio_th) {
+			pthread_join(cleanup_audio_th, NULL);
+		}
+#endif
+
+		_snprintf_s(command, sizeof(command), _TRUNCATE, "\"%s\" -s \"%s\" forward --remove tcp:%hu",
 			    session->adb_path, session->device_serial, session->local_port);
 		if (!scrcpy_run_process(session, "Remove adb forward", command, true, true, NULL)) {
 			obs_log(LOG_INFO, "adb forward removal is optional during cleanup for tcp:%hu",
@@ -2100,6 +2740,8 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 		reconnect_attempts++;
 		if (reconnect_attempts >= 100) {
 			obs_log(LOG_ERROR, "scrcpy auto-reconnect failed 100 times. Giving up.");
+			session->status.phase = SCRCPY_PHASE_FAILED;
+			scrcpy_publish_status(session);
 			break;
 		}
 
@@ -2112,12 +2754,25 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 
 		obs_log(LOG_INFO, "scrcpy auto-reconnect attempt %d, waiting %d ms...", reconnect_attempts, delay_ms);
 
+		/*
+		 * Keep whatever problem was just diagnosed visible while backing off,
+		 * so the banner shows "Device unauthorized ... retrying" rather than a
+		 * bare "Reconnecting" that says nothing about the cause.
+		 */
+		session->status.phase = SCRCPY_PHASE_RECONNECTING;
+		session->status.reconnect_count = reconnect_attempts;
+		scrcpy_publish_status(session);
+
 		for (int i = 0; i < delay_ms; i += 200) {
 			if (scrcpy_should_stop(session))
 				break;
 			Sleep(200);
 		}
 	}
+
+	/* A clean stop should not leave the banner mid-phase. */
+	if (scrcpy_should_stop(session) && session->status.problem == SCRCPY_PROBLEM_NONE)
+		scrcpy_report_phase(session, SCRCPY_PHASE_IDLE);
 
 #ifdef _WIN32
 	WSACleanup();

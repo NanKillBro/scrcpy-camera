@@ -30,13 +30,19 @@
 #else
 #include <stdio.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <limits.h>
 
 #define _TRUNCATE
 #define _snprintf_s(dest, size, _truncate, ...) snprintf((dest), (size), __VA_ARGS__)
 #define strtok_s strtok_r
 #define Sleep(ms) nanosleep(&(struct timespec){.tv_sec = (ms) / 1000, .tv_nsec = ((ms) % 1000) * 1000000L}, NULL)
+#endif
+
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
 #endif
 
 #define ADB_CMD_TIMEOUT_MS 3000
@@ -60,12 +66,158 @@
 #define SETTING_LOW_LATENCY "low_latency"
 
 #ifdef _WIN32
-static const char *const DEFAULT_ADB_PATH = "adb.exe";
 #define ADB_FILTER "Executable (*.exe);;All Files (*.*)"
+#define SERVER_JAR_FILTER "Jar Files (*.jar);;All Files (*.*)"
 #else
-static const char *const DEFAULT_ADB_PATH = "adb";
-#define ADB_FILTER "All Files (*.*)"
+#define ADB_FILTER "All Files (*)"
+#define SERVER_JAR_FILTER "Jar Files (*.jar);;All Files (*)"
 #endif
+
+static const char *scrcpy_get_default_adb_path(void)
+{
+#ifdef _WIN32
+	return "adb.exe";
+#elif defined(__APPLE__)
+	static char cached_path[PATH_MAX] = {0};
+	if (cached_path[0] && access(cached_path, X_OK) == 0)
+		return cached_path;
+
+	const char *candidates[6] = {NULL};
+	char env_home_path[PATH_MAX] = {0};
+	char env_root_path[PATH_MAX] = {0};
+	char home_sdk_path[PATH_MAX] = {0};
+	int count = 0;
+
+	/* 1. Android SDK from environment if set */
+	const char *android_home = getenv("ANDROID_HOME");
+	if (android_home && android_home[0]) {
+		snprintf(env_home_path, sizeof(env_home_path), "%s/platform-tools/adb", android_home);
+		candidates[count++] = env_home_path;
+	}
+
+	const char *android_root = getenv("ANDROID_SDK_ROOT");
+	if (android_root && android_root[0]) {
+		snprintf(env_root_path, sizeof(env_root_path), "%s/platform-tools/adb", android_root);
+		candidates[count++] = env_root_path;
+	}
+
+	/* 2. Standard Android Studio SDK location in user home */
+	const char *home = getenv("HOME");
+	if (home && home[0]) {
+		snprintf(home_sdk_path, sizeof(home_sdk_path), "%s/Library/Android/sdk/platform-tools/adb", home);
+		candidates[count++] = home_sdk_path;
+	}
+
+	/* 3. Apple Silicon & Intel Homebrew, MacPorts */
+	candidates[count++] = "/opt/homebrew/bin/adb";
+	candidates[count++] = "/usr/local/bin/adb";
+	candidates[count++] = "/opt/local/bin/adb";
+
+	for (int i = 0; i < count; i++) {
+		if (candidates[i] && access(candidates[i], X_OK) == 0) {
+			snprintf(cached_path, sizeof(cached_path), "%s", candidates[i]);
+			return cached_path;
+		}
+	}
+	return "adb";
+#else
+	return "adb";
+#endif
+}
+
+static const char *scrcpy_get_default_adb_dir(void)
+{
+#ifdef __APPLE__
+	const char *adb = scrcpy_get_default_adb_path();
+	if (adb && adb[0] == '/') {
+		static char cached_dir[PATH_MAX] = {0};
+		snprintf(cached_dir, sizeof(cached_dir), "%s", adb);
+		char *last_slash = strrchr(cached_dir, '/');
+		if (last_slash) {
+			*last_slash = '\0';
+			return cached_dir;
+		}
+	}
+	if (access("/opt/homebrew/bin", F_OK) == 0)
+		return "/opt/homebrew/bin";
+	if (access("/usr/local/bin", F_OK) == 0)
+		return "/usr/local/bin";
+#endif
+	return NULL;
+}
+
+static char *scrcpy_get_default_server_jar_path(void)
+{
+	char *bundled = obs_module_file("scrcpy-server.jar");
+	if (bundled) {
+		if (access(bundled, F_OK) == 0)
+			return bundled;
+		bfree(bundled);
+	}
+	return bstrdup("scrcpy-server.jar");
+}
+
+#ifdef __APPLE__
+static char *scrcpy_resolve_macos_path(const char *path)
+{
+	if (!path || !path[0])
+		return NULL;
+
+	CFURLRef url =
+		CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault, (const UInt8 *)path, strlen(path), false);
+	if (!url)
+		return NULL;
+
+	Boolean is_alias = false;
+	CFBooleanRef is_alias_val = NULL;
+	if (CFURLCopyResourcePropertyForKey(url, kCFURLIsAliasFileKey, &is_alias_val, NULL) && is_alias_val) {
+		is_alias = CFBooleanGetValue(is_alias_val);
+		CFRelease(is_alias_val);
+	}
+
+	char *resolved = NULL;
+	if (is_alias) {
+		CFDataRef bookmark = CFURLCreateBookmarkDataFromFile(kCFAllocatorDefault, url, NULL);
+		if (bookmark) {
+			Boolean is_stale = false;
+			CFURLRef resolved_url = CFURLCreateByResolvingBookmarkData(kCFAllocatorDefault, bookmark,
+										   kCFBookmarkResolutionWithoutUIMask,
+										   NULL, NULL, &is_stale, NULL);
+			if (resolved_url) {
+				char buffer[PATH_MAX];
+				if (CFURLGetFileSystemRepresentation(resolved_url, true, (UInt8 *)buffer,
+								     sizeof(buffer))) {
+					resolved = bstrdup(buffer);
+				}
+				CFRelease(resolved_url);
+			}
+			CFRelease(bookmark);
+		}
+	}
+	CFRelease(url);
+	return resolved;
+}
+#endif
+
+static char *scrcpy_resolve_file_path(const char *path)
+{
+	if (!path || !path[0])
+		return NULL;
+
+#ifdef __APPLE__
+	char *resolved = scrcpy_resolve_macos_path(path);
+	if (resolved)
+		return resolved;
+#endif
+
+#ifndef _WIN32
+	char real_buf[PATH_MAX];
+	if (realpath(path, real_buf))
+		return bstrdup(real_buf);
+#endif
+
+	return bstrdup(path);
+}
 static const char *const DEFAULT_SCRCPY_VERSION = "4.0";
 
 struct scrcpy_source {
@@ -94,6 +246,30 @@ struct scrcpy_source {
 	bool active;
 	bool restart_pending;
 	uint64_t restart_after_ns;
+
+	/*
+	 * Status shown in the properties banner. Written by the session worker
+	 * thread via scrcpy_source_on_status, read by the OBS UI thread when it
+	 * builds the properties, hence the lock.
+	 */
+	struct scrcpy_status status;
+#ifdef _WIN32
+	CRITICAL_SECTION status_lock;
+#else
+	pthread_mutex_t status_lock;
+#endif
+	/*
+	 * Last text handed to the UI, plus when. A properties refresh rebuilds every
+	 * widget in the dialog and drops keyboard focus, so it must only happen when
+	 * the text actually changed, and not too often.
+	 */
+	char rendered_status[SCRCPY_STATUS_TEXT_SIZE];
+	bool status_dirty;
+	uint64_t last_refresh_ns;
+	/* Last state actually written to the log, so a session stuck in a retry loop
+	 * reports its cause once instead of on every cycle. */
+	enum scrcpy_status_problem last_logged_problem;
+	enum scrcpy_status_phase last_logged_phase;
 };
 
 static void scrcpy_source_update(void *data, obs_data_t *settings);
@@ -104,6 +280,13 @@ static void scrcpy_source_tick(void *data, float seconds);
 static void scrcpy_source_stop_session(struct scrcpy_source *context);
 static void scrcpy_source_on_frame(void *opaque, const struct obs_source_frame *frame);
 static void scrcpy_source_on_audio(void *opaque, const struct obs_source_audio *audio);
+static void scrcpy_source_on_status(void *opaque, const struct scrcpy_status *status);
+static void scrcpy_source_copy_status_text(struct scrcpy_source *context, char *dest, size_t dest_size);
+static enum scrcpy_status_severity scrcpy_source_status_severity(struct scrcpy_source *context);
+static bool scrcpy_source_is_in_use(struct scrcpy_source *context);
+static void scrcpy_source_check_state(struct scrcpy_source *context);
+static void scrcpy_source_show(void *data);
+static void scrcpy_source_hide(void *data);
 
 static uint32_t scrcpy_source_get_width(void *data)
 {
@@ -134,9 +317,17 @@ static void *scrcpy_source_create(obs_data_t *settings, obs_source_t *source)
 	context->session = scrcpy_session_create();
 	context->frame_width = 0;
 	context->frame_height = 0;
+#ifdef _WIN32
+	InitializeCriticalSection(&context->status_lock);
+#else
+	pthread_mutex_init(&context->status_lock, NULL);
+#endif
+	/* Render the idle banner up front so the properties panel is never blank. */
+	scrcpy_status_format(&context->status, context->rendered_status, sizeof(context->rendered_status));
 
 	obs_log(LOG_INFO, "creating scrcpy source scaffold");
 	scrcpy_source_update(context, settings);
+	scrcpy_source_check_state(context);
 	return context;
 }
 
@@ -145,6 +336,10 @@ static void scrcpy_source_destroy(void *data)
 	struct scrcpy_source *context = data;
 	if (!context)
 		return;
+
+	context->restart_pending = false;
+	context->active = false;
+	scrcpy_source_stop_session(context);
 
 	bfree(context->adb_path);
 	bfree(context->device_serial);
@@ -156,7 +351,14 @@ static void scrcpy_source_destroy(void *data)
 	bfree(context->camera_size);
 	bfree(context->audio_source);
 	bfree(context->audio_codec);
+	/* Destroy the session first: its worker thread is joined there, so no status
+	 * callback can still be in flight when the lock goes away. */
 	scrcpy_session_destroy(context->session);
+#ifdef _WIN32
+	DeleteCriticalSection(&context->status_lock);
+#else
+	pthread_mutex_destroy(&context->status_lock);
+#endif
 	bfree(context);
 }
 
@@ -191,11 +393,15 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 	bfree(context->video_source);
 	bfree(context->camera_id);
 	bfree(context->camera_size);
+	bfree(context->audio_source);
 	bfree(context->audio_codec);
-	context->adb_path = bstrdup(adb_path && adb_path[0] ? adb_path : DEFAULT_ADB_PATH);
+	char *default_jar = scrcpy_get_default_server_jar_path();
+	const char *chosen_adb = adb_path && adb_path[0] ? adb_path : scrcpy_get_default_adb_path();
+	const char *chosen_jar = server_jar_path && server_jar_path[0] ? server_jar_path : default_jar;
+	context->adb_path = scrcpy_resolve_file_path(chosen_adb);
 	context->device_serial = bstrdup(device_serial ? device_serial : "");
-	context->server_jar_path =
-		bstrdup(server_jar_path && server_jar_path[0] ? server_jar_path : "scrcpy-server.jar");
+	context->server_jar_path = scrcpy_resolve_file_path(chosen_jar);
+	bfree(default_jar);
 	context->scrcpy_version =
 		bstrdup(scrcpy_version && scrcpy_version[0] ? scrcpy_version : DEFAULT_SCRCPY_VERSION);
 	context->video_codec = bstrdup(video_codec && video_codec[0] ? video_codec : "h264");
@@ -245,7 +451,7 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 		context->max_size, context->camera_size, context->audio_enabled ? "on" : "off", context->audio_codec,
 		(unsigned)context->low_latency_level);
 
-	if (context->active) {
+	if (scrcpy_source_is_in_use(context)) {
 		context->restart_pending = true;
 		context->restart_after_ns = os_gettime_ns() + 800000000ULL; /* 800 ms debounce */
 	}
@@ -253,9 +459,11 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 
 static void scrcpy_source_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_string(settings, SETTING_ADB_PATH, DEFAULT_ADB_PATH);
+	char *default_jar = scrcpy_get_default_server_jar_path();
+	obs_data_set_default_string(settings, SETTING_ADB_PATH, scrcpy_get_default_adb_path());
 	obs_data_set_default_string(settings, SETTING_DEVICE_SERIAL, "");
-	obs_data_set_default_string(settings, SETTING_SERVER_JAR_PATH, "scrcpy-server.jar");
+	obs_data_set_default_string(settings, SETTING_SERVER_JAR_PATH, default_jar);
+	bfree(default_jar);
 	obs_data_set_default_string(settings, SETTING_SCRCPY_VERSION, DEFAULT_SCRCPY_VERSION);
 	obs_data_set_default_string(settings, SETTING_VIDEO_CODEC, "h264");
 	obs_data_set_default_int(settings, SETTING_LOCAL_PORT, 27183);
@@ -308,7 +516,41 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 	obs_property_t *cam_id_prop;
 
 	obs_properties_t *props = obs_properties_create();
-	obs_properties_add_path(props, SETTING_ADB_PATH, "ADB executable", OBS_PATH_FILE, ADB_FILTER, NULL);
+
+	/*
+	 * Live status banner, first so it is the first thing seen on opening the
+	 * dialog.
+	 *
+	 * The text is passed as the property *description*, not as a settings value:
+	 * OBS renders OBS_TEXT_INFO by reading obs_data_get_string(settings, name)
+	 * and, when that is empty, falls back to the description and drops the
+	 * left-hand label, giving a full-width banner. Keeping it out of settings
+	 * also means status never dirties the scene collection or gets saved to disk.
+	 */
+	if (context) {
+		char status_text[SCRCPY_STATUS_TEXT_SIZE];
+		obs_property_t *status_prop;
+
+		scrcpy_source_copy_status_text(context, status_text, sizeof(status_text));
+		status_prop = obs_properties_add_text(props, "scrcpy_status", status_text, OBS_TEXT_INFO);
+		if (status_prop) {
+			switch (scrcpy_source_status_severity(context)) {
+			case SCRCPY_SEVERITY_WARNING:
+				obs_property_text_set_info_type(status_prop, OBS_TEXT_INFO_WARNING);
+				break;
+			case SCRCPY_SEVERITY_ERROR:
+				obs_property_text_set_info_type(status_prop, OBS_TEXT_INFO_ERROR);
+				break;
+			case SCRCPY_SEVERITY_INFO:
+				obs_property_text_set_info_type(status_prop, OBS_TEXT_INFO_NORMAL);
+				break;
+			}
+			obs_property_text_set_info_word_wrap(status_prop, true);
+		}
+	}
+
+	obs_properties_add_path(props, SETTING_ADB_PATH, "ADB executable", OBS_PATH_FILE, ADB_FILTER,
+				scrcpy_get_default_adb_dir());
 
 	obs_property_t *device_list = obs_properties_add_list(props, SETTING_DEVICE_SERIAL, "ADB device",
 							      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -328,7 +570,7 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 	obs_properties_add_button2(props, "refresh_devices", "Refresh device list", scrcpy_refresh_button_clicked,
 				   context);
 	obs_properties_add_path(props, SETTING_SERVER_JAR_PATH, "scrcpy-server.jar path", OBS_PATH_FILE,
-				"Jar Files (*.jar);;All Files (*.*)", NULL);
+				SERVER_JAR_FILTER, NULL);
 	obs_properties_add_text(props, SETTING_SCRCPY_VERSION, "scrcpy protocol version", OBS_TEXT_DEFAULT);
 
 	vsource_list = obs_properties_add_list(props, SETTING_VIDEO_SOURCE, "Video source", OBS_COMBO_TYPE_LIST,
@@ -407,6 +649,9 @@ static void scrcpy_source_start_session(struct scrcpy_source *context)
 	if (!context || !context->session)
 		return;
 
+	if (scrcpy_session_is_running(context->session))
+		return;
+
 	config.adb_path = context->adb_path;
 	config.device_serial = context->device_serial;
 	config.server_jar_path = context->server_jar_path;
@@ -428,9 +673,113 @@ static void scrcpy_source_start_session(struct scrcpy_source *context)
 	config.on_frame_opaque = context;
 	config.on_audio = scrcpy_source_on_audio;
 	config.on_audio_opaque = context;
+	config.on_status = scrcpy_source_on_status;
+	config.on_status_opaque = context;
 
-	if (scrcpy_session_start(context->session, &config) != 0)
-		obs_log(LOG_WARNING, "unable to start scrcpy bootstrap session");
+	/* -2 just means no device is picked yet, which the status banner already
+	 * explains; it is not a warning worth shouting about in the log. */
+	int start_ret = scrcpy_session_start(context->session, &config);
+	if (start_ret != 0 && start_ret != -2)
+		obs_log(LOG_WARNING, "unable to start scrcpy bootstrap session (%d)", start_ret);
+}
+
+static void scrcpy_source_lock_status(struct scrcpy_source *context)
+{
+#ifdef _WIN32
+	EnterCriticalSection(&context->status_lock);
+#else
+	pthread_mutex_lock(&context->status_lock);
+#endif
+}
+
+static void scrcpy_source_unlock_status(struct scrcpy_source *context)
+{
+#ifdef _WIN32
+	LeaveCriticalSection(&context->status_lock);
+#else
+	pthread_mutex_unlock(&context->status_lock);
+#endif
+}
+
+/*
+ * Receives status from the session worker thread.
+ *
+ * Only records it here; the actual UI refresh is flushed from the video tick.
+ * Refreshing makes OBS tear down and rebuild every widget in the properties
+ * dialog (ReloadProperties -> RefreshProperties), which loses keyboard focus, so
+ * it has to be both change-gated and rate-limited. Doing the flush in the tick
+ * also means a refresh that gets rate-limited is retried rather than lost.
+ */
+static void scrcpy_source_on_status(void *opaque, const struct scrcpy_status *status)
+{
+	struct scrcpy_source *context = opaque;
+	char rendered[SCRCPY_STATUS_TEXT_SIZE];
+
+	if (!context || !status)
+		return;
+
+	scrcpy_status_format(status, rendered, sizeof(rendered));
+
+	/*
+	 * Also decide here what, if anything, to log. Deliberately not every
+	 * transition: a session retrying a dead device walks the same phases every
+	 * couple of seconds, so log a problem once per distinct cause, plus the
+	 * states worth a line on their own. Mirroring it means a support request
+	 * carrying only the OBS log still shows what the user saw in the banner.
+	 *
+	 * The decision is made under the lock because this callback arrives from the
+	 * session worker thread and, for the no-device case, from the OBS thread.
+	 */
+	bool notable_phase = status->phase == SCRCPY_PHASE_STREAMING || status->phase == SCRCPY_PHASE_NO_DEVICE ||
+			     status->phase == SCRCPY_PHASE_FAILED;
+	bool log_problem = false;
+	bool log_phase = false;
+
+	scrcpy_source_lock_status(context);
+	context->status = *status;
+	if (strcmp(context->rendered_status, rendered) != 0) {
+		snprintf(context->rendered_status, sizeof(context->rendered_status), "%s", rendered);
+		context->status_dirty = true;
+	}
+
+	if (status->problem != SCRCPY_PROBLEM_NONE && status->problem != context->last_logged_problem) {
+		context->last_logged_problem = status->problem;
+		context->last_logged_phase = status->phase;
+		log_problem = true;
+	} else if (notable_phase && status->phase != context->last_logged_phase) {
+		context->last_logged_phase = status->phase;
+		/* A healthy stream means any earlier cause is resolved; allow it to be
+		 * reported again if it comes back. */
+		if (status->phase == SCRCPY_PHASE_STREAMING)
+			context->last_logged_problem = SCRCPY_PROBLEM_NONE;
+		log_phase = true;
+	}
+	scrcpy_source_unlock_status(context);
+
+	if (log_problem)
+		obs_log(LOG_WARNING, "status [%s]: %s - %s", obs_source_get_name(context->source),
+			scrcpy_status_phase_label(status->phase), scrcpy_status_problem_title(status->problem));
+	else if (log_phase)
+		obs_log(LOG_INFO, "status [%s]: %s", obs_source_get_name(context->source),
+			scrcpy_status_phase_label(status->phase));
+}
+
+/* Copies the current banner text out for the UI thread. */
+static void scrcpy_source_copy_status_text(struct scrcpy_source *context, char *dest, size_t dest_size)
+{
+	scrcpy_source_lock_status(context);
+	snprintf(dest, dest_size, "%s", context->rendered_status);
+	scrcpy_source_unlock_status(context);
+}
+
+static enum scrcpy_status_severity scrcpy_source_status_severity(struct scrcpy_source *context)
+{
+	enum scrcpy_status_severity severity;
+
+	scrcpy_source_lock_status(context);
+	severity = scrcpy_status_severity(&context->status);
+	scrcpy_source_unlock_status(context);
+	return severity;
 }
 
 static void scrcpy_source_stop_session(struct scrcpy_source *context)
@@ -461,40 +810,95 @@ static void scrcpy_source_on_audio(void *opaque, const struct obs_source_audio *
 	obs_source_output_audio(context->source, audio);
 }
 
+static bool scrcpy_source_is_in_use(struct scrcpy_source *context)
+{
+	if (!context || !context->source)
+		return false;
+
+	return obs_source_showing(context->source) || obs_source_active(context->source);
+}
+
+static void scrcpy_source_check_state(struct scrcpy_source *context)
+{
+	if (!context)
+		return;
+
+	bool in_use = scrcpy_source_is_in_use(context);
+	context->active = in_use;
+
+	if (in_use) {
+		if (!scrcpy_session_is_running(context->session)) {
+			scrcpy_source_start_session(context);
+		}
+	} else {
+		context->restart_pending = false;
+		if (scrcpy_session_is_running(context->session)) {
+			scrcpy_source_stop_session(context);
+		}
+	}
+}
+
 static void scrcpy_source_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
 	struct scrcpy_source *context = data;
-	if (!context || !context->restart_pending)
+	if (!context)
+		return;
+
+	/*
+	 * Push a pending status change to the properties dialog. Rate-limited
+	 * because each refresh rebuilds the whole dialog; the dirty flag means a
+	 * skipped refresh is retried on a later tick instead of being lost.
+	 */
+	uint64_t now_ns = os_gettime_ns();
+	bool refresh = false;
+
+	scrcpy_source_lock_status(context);
+	if (context->status_dirty && (!context->last_refresh_ns || now_ns - context->last_refresh_ns >= 500000000ULL)) {
+		context->status_dirty = false;
+		context->last_refresh_ns = now_ns;
+		refresh = true;
+	}
+	scrcpy_source_unlock_status(context);
+
+	if (refresh)
+		obs_source_update_properties(context->source);
+
+	if (!context->restart_pending)
 		return;
 
 	if (os_gettime_ns() < context->restart_after_ns)
 		return;
 
 	context->restart_pending = false;
-	scrcpy_source_stop_session(context);
-	scrcpy_source_start_session(context);
+	if (scrcpy_source_is_in_use(context)) {
+		scrcpy_source_stop_session(context);
+		scrcpy_source_start_session(context);
+	}
 }
 
 static void scrcpy_source_activate(void *data)
 {
 	struct scrcpy_source *context = data;
-	if (!context)
-		return;
-
-	context->active = true;
-	scrcpy_source_start_session(context);
+	scrcpy_source_check_state(context);
 }
 
 static void scrcpy_source_deactivate(void *data)
 {
 	struct scrcpy_source *context = data;
-	if (!context)
-		return;
+	scrcpy_source_check_state(context);
+}
 
-	context->restart_pending = false;
-	context->active = false;
-	scrcpy_source_stop_session(context);
+static void scrcpy_source_show(void *data)
+{
+	struct scrcpy_source *context = data;
+	scrcpy_source_check_state(context);
+}
+
+static void scrcpy_source_hide(void *data)
+{
+	struct scrcpy_source *context = data;
+	scrcpy_source_check_state(context);
 }
 
 static int scrcpy_parse_adb_devices_from_string(const char *text, obs_property_t *list)
@@ -533,11 +937,39 @@ static int scrcpy_parse_adb_devices_from_string(const char *text, obs_property_t
 		if (!serial || !state)
 			continue;
 
-		if (strcmp(state, "device") != 0)
+		if (strcmp(state, "device") == 0) {
+			obs_property_list_add_string(list, serial, serial);
+			++found;
 			continue;
+		}
 
-		obs_property_list_add_string(list, serial, serial);
-		++found;
+		/*
+		 * Anything not in the "device" state used to be dropped silently, so a
+		 * phone that was plugged in but unauthorized produced "No online ADB
+		 * devices" and no hint that the cable was fine. Keep these rows, with
+		 * the reason, and an empty value so they cannot be selected.
+		 */
+		char label[256];
+		const char *hint = "";
+
+		if (strcmp(state, "unauthorized") == 0)
+			hint = " \xE2\x80\x94 unauthorized: tap \"Allow USB debugging\" on the device";
+		else if (strcmp(state, "authorizing") == 0)
+			hint = " \xE2\x80\x94 still authorizing, wait a moment";
+		else if (strcmp(state, "offline") == 0)
+			hint = " \xE2\x80\x94 offline: unplug and replug the device";
+		else if (strcmp(state, "no") == 0) /* "no permissions" splits on the space */
+			hint = " \xE2\x80\x94 no permissions: check your udev rules";
+		else if (strcmp(state, "recovery") == 0 || strcmp(state, "sideload") == 0 ||
+			 strcmp(state, "bootloader") == 0)
+			hint = " \xE2\x80\x94 not booted into Android";
+
+		if (hint[0])
+			_snprintf_s(label, sizeof(label), _TRUNCATE, "%s%s", serial, hint);
+		else
+			_snprintf_s(label, sizeof(label), _TRUNCATE, "%s \xE2\x80\x94 %s", serial, state);
+
+		obs_property_list_add_string(list, label, "");
 	}
 
 	return found;
@@ -558,7 +990,7 @@ static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char 
 {
 	char command[1024];
 
-	_snprintf_s(command, sizeof(command), _TRUNCATE, "%s %s", adb_path, args);
+	_snprintf_s(command, sizeof(command), _TRUNCATE, "\"%s\" %s", adb_path, args);
 
 #ifdef _WIN32
 	STARTUPINFOA si;
@@ -702,7 +1134,7 @@ static int scrcpy_discover_mdns_devices(const char *adb_path)
 
 static int scrcpy_refresh_device_list(struct scrcpy_source *context, obs_property_t *list)
 {
-	const char *adb_path = DEFAULT_ADB_PATH;
+	const char *adb_path = scrcpy_get_default_adb_path();
 	int found = 0;
 	char devices_output[4096];
 
@@ -764,12 +1196,15 @@ static struct obs_source_info scrcpy_source_info = {
 	.destroy = scrcpy_source_destroy,
 	.activate = scrcpy_source_activate,
 	.deactivate = scrcpy_source_deactivate,
+	.show = scrcpy_source_show,
+	.hide = scrcpy_source_hide,
 	.update = scrcpy_source_update,
 	.video_tick = scrcpy_source_tick,
 	.get_defaults = scrcpy_source_defaults,
 	.get_properties = scrcpy_source_properties,
 	.get_width = scrcpy_source_get_width,
 	.get_height = scrcpy_source_get_height,
+	.icon_type = OBS_ICON_TYPE_CAMERA,
 };
 
 void scrcpy_source_register(void)

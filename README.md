@@ -17,7 +17,7 @@ By integrating `scrcpy` directly into OBS Studio, this plugin eliminates the nee
 - **Direct Android Capture:** Connect to your Android device via ADB and capture its screen or camera directly in OBS.
 - **Screen & Camera Modes:** Choose to mirror the device's screen or use its front/back cameras as a webcam.
 - **Audio Forwarding:** Optionally capture device audio (Android 11+) with support for Output, Playback (Android 13+ duplication), and Mic sources plus Opus, AAC, FLAC, and raw PCM codecs.
-- **Hardware Decoding:** Utilizes FFmpeg hardware decoding (CUDA, QSV, D3D11VA, DXVA2; plus VAAPI and VDPAU on Linux) for optimized performance.
+- **Hardware Decoding:** Utilizes FFmpeg hardware decoding (CUDA, QSV, D3D11VA, DXVA2; VAAPI and VDPAU on Linux; VideoToolbox on macOS) for optimized performance.
 - **Configurable Video Settings:** Adjust video codec (H.264, H.265), bitrate, maximum resolution, and camera size right from the OBS source properties.
 - **Automatic Device Discovery:** Easily select from a list of connected ADB devices.
 
@@ -64,6 +64,23 @@ This project uses CMake and builds on Windows, macOS, and Linux. To build the pl
 cmake -B build
 cmake --build build
 ```
+
+### macOS
+
+Ensure Xcode and CMake are installed. The macOS build uses the `macos` CMake preset (Xcode generator) and produces a universal binary (`arm64` + `x86_64`) compatible with both Apple Silicon and Intel Macs:
+
+```bash
+# Configure the build (automatically fetches and configures dependencies)
+cmake --preset macos
+
+# Build the plugin
+cmake --build --preset macos
+
+# Install to ~/Library/Application Support/obs-studio/plugins
+cmake --install build_macos --config RelWithDebInfo
+```
+
+The resulting plugin bundle is built at `build_macos/RelWithDebInfo/scrcpy-camera.plugin` (and staged under `build_macos/rundir/RelWithDebInfo/`). On macOS, hardware decoding uses VideoToolbox.
 
 ### Linux (Ubuntu/Debian)
 
