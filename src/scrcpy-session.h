@@ -40,6 +40,9 @@ struct scrcpy_session_config {
 	uint16_t local_port;
 	uint32_t video_bit_rate;
 	uint16_t max_size;
+	uint16_t max_fps;       /* 0 = unset; screen only (encoder cap) */
+	uint16_t camera_fps;    /* 0 = device default; camera only */
+	bool camera_high_speed; /* camera only; requires camera_fps > 0 */
 	bool hw_decoding;
 	bool audio_enabled;
 	const char *audio_source;

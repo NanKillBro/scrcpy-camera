@@ -93,6 +93,9 @@ struct scrcpy_session {
 	uint16_t local_port;
 	uint32_t video_bit_rate;
 	uint16_t max_size;
+	uint16_t max_fps;       /* 0 = unset; screen only (encoder cap) */
+	uint16_t camera_fps;    /* 0 = device default; camera only */
+	bool camera_high_speed; /* camera only; requires camera_fps > 0 */
 	uint32_t scid;
 	bool hw_decoding;
 	enum AVHWDeviceType hw_device_type;
@@ -200,6 +203,9 @@ static void scrcpy_copy_config(struct scrcpy_session *session, const struct scrc
 	session->video_bit_rate = config->video_bit_rate ? config->video_bit_rate : 8000000;
 	session->audio_bit_rate = config->audio_bit_rate ? config->audio_bit_rate : 128000;
 	session->max_size = config->max_size;
+	session->max_fps = config->max_fps;
+	session->camera_fps = config->camera_fps;
+	session->camera_high_speed = config->camera_high_speed;
 	session->hw_decoding = config->hw_decoding;
 	session->audio_enabled = config->audio_enabled;
 	session->low_latency_level = config->low_latency_level;
@@ -1930,12 +1936,27 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 				len += _snprintf_s(command + len, sizeof(command) - len, _TRUNCATE, " max_size=%hu",
 						   max_size);
 			}
+			/* Encoder-level frame cap, screen only. In camera mode the fps
+			 * comes solely from camera_fps, so a high-speed stream is never
+			 * capped. */
+			if (session->max_fps > 0 && strcmp(session->video_source, "camera") != 0) {
+				len += _snprintf_s(command + len, sizeof(command) - len, _TRUNCATE, " max_fps=%hu",
+						   session->max_fps);
+			}
 			if (strcmp(session->video_source, "camera") == 0) {
 				len += _snprintf_s(command + len, sizeof(command) - len, _TRUNCATE,
 						   " video_source=camera camera_id=%s", session->camera_id);
 				if (has_camera_size) {
 					len += _snprintf_s(command + len, sizeof(command) - len, _TRUNCATE,
 							   " camera_size=%s", session->camera_size);
+				}
+				if (session->camera_fps > 0) {
+					len += _snprintf_s(command + len, sizeof(command) - len, _TRUNCATE,
+							   " camera_fps=%hu", session->camera_fps);
+				}
+				if (session->camera_high_speed) {
+					len += _snprintf_s(command + len, sizeof(command) - len, _TRUNCATE,
+							   " camera_high_speed=true");
 				}
 			}
 			if (session->audio_enabled) {

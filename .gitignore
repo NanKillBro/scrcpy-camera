@@ -53,3 +53,6 @@ Thumbs.db
 # Project specific
 *.lock.json
 .kilo/
+
+# Local reference clone of upstream scrcpy (nested git repo, not a submodule)
+/scrcpy/
