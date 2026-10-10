@@ -18,7 +18,7 @@ By integrating `scrcpy` directly into OBS Studio, this plugin eliminates the nee
 - **Screen & Camera Modes:** Choose to mirror the device's screen or use its front/back cameras as a webcam.
 - **Frame-rate Selection:** Cap the screen stream at 30/60 fps, or set the camera to 30/60 fps — camera sources additionally support 120/240 fps high-speed capture.
 - **Audio Forwarding:** Optionally capture device audio (Android 11+) with support for Output, Playback (Android 13+ duplication), and Mic sources plus Opus, AAC, FLAC, and raw PCM codecs.
-- **Hardware Decoding:** Utilizes FFmpeg hardware decoding (CUDA, QSV, D3D11VA, DXVA2; plus VAAPI and VDPAU on Linux) for optimized performance.
+- **Hardware Decoding:** Utilizes FFmpeg hardware decoding (CUDA, QSV, D3D11VA, DXVA2; plus VAAPI and VDPAU on Linux) for optimized performance. The backend is chosen by querying what the selected video codec actually supports, and the one in use is named in the OBS log (`video decoding: vaapi (hevc)`), so a fallback to software is visible rather than silent.
 - **Configurable Video Settings:** Adjust video codec (H.264, H.265), bitrate, maximum resolution, and camera size right from the OBS source properties.
 - **Automatic Device Discovery:** Easily select from a list of connected ADB devices.
 
@@ -37,7 +37,7 @@ By integrating `scrcpy` directly into OBS Studio, this plugin eliminates the nee
 - **scrcpy-server.jar:** The server component of `scrcpy` that runs on the Android device. This needs to be available on your system. On Linux, building from source additionally requires the development packages listed under [Building from Source](#building-from-source).
 
 > [!IMPORTANT]
-> This plugin is currently only compatible with **scrcpy v4.0**. You must download the exact `scrcpy-server-v4.0` file from the [scrcpy v4.0 release page](https://github.com/Genymobile/scrcpy/releases/tag/v4.0) and rename it to `scrcpy-server.jar`. Other versions are not guaranteed to work.
+> This plugin targets **scrcpy v5.0.1**. Download the exact `scrcpy-server-v5.0.1` file from the [scrcpy v5.0.1 release page](https://github.com/Genymobile/scrcpy/releases/tag/v5.0.1) and rename it to `scrcpy-server.jar`. The **scrcpy protocol version** dropdown in the source properties must match the jar you downloaded — the server compares the two with exact string equality and refuses the connection on any mismatch. Older servers (5.0, 4.1, 4.0) still work if you select the matching version in that dropdown.
 
 ## Usage
 
@@ -47,6 +47,7 @@ By integrating `scrcpy` directly into OBS Studio, this plugin eliminates the nee
    - **ADB executable:** Path to your `adb` executable (default is `adb.exe` on Windows, `adb` on Linux/macOS).
    - **ADB device:** Select your connected device from the dropdown, or click "Refresh device list" to scan.
    - **scrcpy-server.jar path:** Path to the `scrcpy-server.jar` file on your computer.
+   - **scrcpy protocol version:** Must match the jar above. Leave at **5.0.1** unless you are deliberately using an older server.
    - **Video source:** Choose between **Screen** (display mirroring) and **Camera**.
    - **Frame rate:** Leave at **Default** (device default), or pick 30/60 fps. On **Camera** sources, 120 and 240 fps **High-speed** entries are also available.
    - **Video codec:** Choose between H.264 (AVC) and H.265 (HEVC).

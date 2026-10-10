@@ -69,7 +69,7 @@ static const char *const DEFAULT_ADB_PATH = "adb.exe";
 static const char *const DEFAULT_ADB_PATH = "adb";
 #define ADB_FILTER "All Files (*.*)"
 #endif
-static const char *const DEFAULT_SCRCPY_VERSION = "4.0";
+static const char *const DEFAULT_SCRCPY_VERSION = "5.0.1";
 
 /*
  * Placeholder entries shown in the ADB device combo. The combo is editable and
@@ -516,7 +516,22 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 
 	obs_properties_add_path(props, SETTING_SERVER_JAR_PATH, "scrcpy-server.jar path", OBS_PATH_FILE,
 				"Jar Files (*.jar);;All Files (*.*)", NULL);
-	obs_properties_add_text(props, SETTING_SCRCPY_VERSION, "scrcpy protocol version", OBS_TEXT_DEFAULT);
+	/*
+	 * A list, not an editable combo: the server compares this string against
+	 * its own BuildConfig.VERSION_NAME with exact equality and aborts on any
+	 * mismatch, so a typo here is unrecoverable at runtime.
+	 */
+	obs_property_t *version_list = obs_properties_add_list(props, SETTING_SCRCPY_VERSION, "scrcpy protocol version",
+							       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(version_list, "5.0.1 (recommended)", "5.0.1");
+	obs_property_list_add_string(version_list, "5.0", "5.0");
+	obs_property_list_add_string(version_list, "4.1", "4.1");
+	obs_property_list_add_string(version_list, "4.0", "4.0");
+	obs_property_set_long_description(
+		version_list,
+		"Must match the scrcpy-server.jar above exactly. Download scrcpy-server-v5.0.1 from the scrcpy "
+		"v5.0.1 release page and rename it to scrcpy-server.jar. If this does not match the jar, the "
+		"server refuses the connection with \"The server version (X) does not match the client (Y)\".");
 
 	vsource_list = obs_properties_add_list(props, SETTING_VIDEO_SOURCE, "Video source", OBS_COMBO_TYPE_LIST,
 					       OBS_COMBO_FORMAT_STRING);
