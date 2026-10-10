@@ -42,7 +42,9 @@
 #define ADB_CMD_TIMEOUT_MS 3000
 
 #define SETTING_ADB_PATH "adb_path"
+#define SETTING_CONNECTION_TYPE "connection_type"
 #define SETTING_DEVICE_SERIAL "device_serial"
+#define SETTING_MANUAL_SERIAL "manual_serial"
 #define SETTING_SERVER_JAR_PATH "server_jar_path"
 #define SETTING_SCRCPY_VERSION "scrcpy_version"
 #define SETTING_LOCAL_PORT "local_port"
@@ -68,6 +70,70 @@ static const char *const DEFAULT_ADB_PATH = "adb";
 #define ADB_FILTER "All Files (*.*)"
 #endif
 static const char *const DEFAULT_SCRCPY_VERSION = "4.0";
+
+/*
+ * Placeholder entries shown in the ADB device combo. The combo is editable and
+ * OBS saves the displayed text as the setting, so scrcpy_is_placeholder_serial()
+ * must treat these as "no serial selected". Every placeholder added to the
+ * device list comes from this array so the texts and the sanitizer cannot drift.
+ */
+enum device_list_placeholder {
+	DEVICE_LIST_PLACEHOLDER_CLICK_REFRESH,
+	DEVICE_LIST_PLACEHOLDER_SELECT_DEVICE,
+	DEVICE_LIST_PLACEHOLDER_ADB_FAILED,
+	DEVICE_LIST_PLACEHOLDER_NO_DEVICES,
+	DEVICE_LIST_PLACEHOLDER_COUNT,
+};
+
+static const char *const DEVICE_LIST_PLACEHOLDERS[DEVICE_LIST_PLACEHOLDER_COUNT] = {
+	"(Click Refresh to scan)",
+	"(Select device)",
+	"ADB command failed - enter serial manually",
+	"No online ADB devices - enter serial manually",
+};
+
+static bool scrcpy_is_placeholder_serial(const char *serial)
+{
+	size_t i;
+
+	if (!serial)
+		return false;
+	for (i = 0; i < DEVICE_LIST_PLACEHOLDER_COUNT; ++i) {
+		if (strcmp(serial, DEVICE_LIST_PLACEHOLDERS[i]) == 0)
+			return true;
+	}
+	return false;
+}
+
+static bool scrcpy_is_serial_space(char c)
+{
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+/*
+ * The device combo is editable, so the stored text can be anything typed or
+ * picked there, including the placeholder hints. ADB serials never contain
+ * whitespace: trim it and turn placeholders into an empty serial.
+ */
+static char *scrcpy_sanitize_device_serial(const char *serial)
+{
+	char *copy = bstrdup(serial ? serial : "");
+	size_t start = 0;
+	size_t end = strlen(copy);
+
+	while (start < end && scrcpy_is_serial_space(copy[start]))
+		++start;
+	while (end > start && scrcpy_is_serial_space(copy[end - 1]))
+		--end;
+
+	if (start > 0)
+		memmove(copy, copy + start, end - start);
+	copy[end - start] = '\0';
+
+	if (scrcpy_is_placeholder_serial(copy))
+		copy[0] = '\0';
+	return copy;
+}
 
 struct scrcpy_source {
 	obs_source_t *source;
@@ -180,7 +246,9 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 		return;
 
 	const char *adb_path = obs_data_get_string(settings, SETTING_ADB_PATH);
+	const char *connection_type = obs_data_get_string(settings, SETTING_CONNECTION_TYPE);
 	const char *device_serial = obs_data_get_string(settings, SETTING_DEVICE_SERIAL);
+	const char *manual_serial = obs_data_get_string(settings, SETTING_MANUAL_SERIAL);
 	const char *server_jar_path = obs_data_get_string(settings, SETTING_SERVER_JAR_PATH);
 	const char *scrcpy_version = obs_data_get_string(settings, SETTING_SCRCPY_VERSION);
 	const char *video_codec = obs_data_get_string(settings, SETTING_VIDEO_CODEC);
@@ -197,7 +265,6 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 	bool audio_enabled = obs_data_get_bool(settings, SETTING_AUDIO_ENABLED);
 
 	bfree(context->adb_path);
-	bfree(context->device_serial);
 	bfree(context->server_jar_path);
 	bfree(context->scrcpy_version);
 	bfree(context->video_codec);
@@ -206,7 +273,6 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 	bfree(context->camera_size);
 	bfree(context->audio_codec);
 	context->adb_path = bstrdup(adb_path && adb_path[0] ? adb_path : DEFAULT_ADB_PATH);
-	context->device_serial = bstrdup(device_serial ? device_serial : "");
 	context->server_jar_path =
 		bstrdup(server_jar_path && server_jar_path[0] ? server_jar_path : "scrcpy-server.jar");
 	context->scrcpy_version =
@@ -222,6 +288,20 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 	char *space = strchr(context->camera_id, ' ');
 	if (space)
 		*space = '\0';
+
+	/*
+	 * Effective serial: picked from the scan list or typed in the manual field,
+	 * depending on the connection type. Sanitized: trimmed, placeholders from
+	 * the device combo treated as empty. Log when a non-empty serial is newly
+	 * stored (typed manually or picked from a scan).
+	 */
+	bool manual_mode = connection_type && strcmp(connection_type, "manual") == 0;
+	char *previous_serial = context->device_serial;
+	context->device_serial = scrcpy_sanitize_device_serial(manual_mode ? manual_serial : device_serial);
+	bool serial_changed = strcmp(context->device_serial, previous_serial ? previous_serial : "") != 0;
+	if (context->device_serial[0] && serial_changed)
+		obs_log(LOG_INFO, "scrcpy: device serial set to '%s'", context->device_serial);
+	bfree(previous_serial);
 
 	if (local_port < 1 || local_port > 65535)
 		local_port = 27183;
@@ -294,14 +374,21 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 
 	if (scrcpy_source_is_in_use(context)) {
 		context->restart_pending = true;
-		context->restart_after_ns = os_gettime_ns() + 800000000ULL; /* 800 ms debounce */
+		/* OBS fires one update per keystroke in text fields. A serial typed
+		 * in the manual field must settle before the session restarts, or
+		 * every pause mid-typing would attempt connections with a partial
+		 * serial; other settings keep the short debounce. */
+		uint64_t debounce_ns = (serial_changed && manual_mode) ? 2000000000ULL : 800000000ULL;
+		context->restart_after_ns = os_gettime_ns() + debounce_ns;
 	}
 }
 
 static void scrcpy_source_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, SETTING_ADB_PATH, DEFAULT_ADB_PATH);
+	obs_data_set_default_string(settings, SETTING_CONNECTION_TYPE, "scan");
 	obs_data_set_default_string(settings, SETTING_DEVICE_SERIAL, "");
+	obs_data_set_default_string(settings, SETTING_MANUAL_SERIAL, "");
 	obs_data_set_default_string(settings, SETTING_SERVER_JAR_PATH, "scrcpy-server.jar");
 	obs_data_set_default_string(settings, SETTING_SCRCPY_VERSION, DEFAULT_SCRCPY_VERSION);
 	obs_data_set_default_string(settings, SETTING_VIDEO_CODEC, "h264");
@@ -353,6 +440,17 @@ static bool scrcpy_video_source_changed(obs_properties_t *props, obs_property_t 
 	return true;
 }
 
+static bool scrcpy_connection_type_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(p);
+	const char *val = obs_data_get_string(settings, SETTING_CONNECTION_TYPE);
+	bool manual = (val && strcmp(val, "manual") == 0);
+	obs_property_set_visible(obs_properties_get(props, SETTING_DEVICE_SERIAL), !manual);
+	obs_property_set_visible(obs_properties_get(props, "refresh_devices"), !manual);
+	obs_property_set_visible(obs_properties_get(props, SETTING_MANUAL_SERIAL), manual);
+	return true;
+}
+
 static bool scrcpy_audio_enabled_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
 	UNUSED_PARAMETER(p);
@@ -377,6 +475,12 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 	obs_properties_t *props = obs_properties_create();
 	obs_properties_add_path(props, SETTING_ADB_PATH, "ADB executable", OBS_PATH_FILE, ADB_FILTER, NULL);
 
+	obs_property_t *conn_type_list = obs_properties_add_list(props, SETTING_CONNECTION_TYPE, "Connect type",
+								 OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(conn_type_list, "Scan (ADB devices)", "scan");
+	obs_property_list_add_string(conn_type_list, "Enter serial manually", "manual");
+	obs_property_set_modified_callback(conn_type_list, scrcpy_connection_type_changed);
+
 	obs_property_t *device_list = obs_properties_add_list(props, SETTING_DEVICE_SERIAL, "ADB device",
 							      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	if (device_list) {
@@ -387,13 +491,29 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 		 * button so the properties panel opens instantly. Keep the currently
 		 * configured device, if any, so the saved selection is preserved.
 		 */
-		obs_property_list_add_string(device_list, "(Click Refresh to scan)", "");
+		obs_property_list_add_string(device_list,
+					     DEVICE_LIST_PLACEHOLDERS[DEVICE_LIST_PLACEHOLDER_CLICK_REFRESH], "");
 		if (context && context->device_serial && context->device_serial[0])
 			obs_property_list_add_string(device_list, context->device_serial, context->device_serial);
+		obs_property_set_long_description(
+			device_list,
+			"Click \"Refresh device list\" to scan for connected ADB devices and pick one. If scanning "
+			"fails or lists nothing, switch Connect type to \"Enter serial manually\".");
 	}
 
 	obs_properties_add_button2(props, "refresh_devices", "Refresh device list", scrcpy_refresh_button_clicked,
 				   context);
+
+	obs_property_t *manual_serial_text =
+		obs_properties_add_text(props, SETTING_MANUAL_SERIAL, "ADB serial", OBS_TEXT_DEFAULT);
+	if (manual_serial_text) {
+		obs_property_set_long_description(
+			manual_serial_text,
+			"ADB serial of the device to connect to without scanning, e.g. 192.168.1.42:5555 for "
+			"wireless debugging or the USB serial reported by 'adb devices'. This only skips device "
+			"enumeration - the ADB executable itself must still be able to run.");
+	}
+
 	obs_properties_add_path(props, SETTING_SERVER_JAR_PATH, "scrcpy-server.jar path", OBS_PATH_FILE,
 				"Jar Files (*.jar);;All Files (*.*)", NULL);
 	obs_properties_add_text(props, SETTING_SCRCPY_VERSION, "scrcpy protocol version", OBS_TEXT_DEFAULT);
@@ -616,7 +736,8 @@ static void scrcpy_source_hide(void *data)
 	scrcpy_source_check_state(context);
 }
 
-static int scrcpy_parse_adb_devices_from_string(const char *text, obs_property_t *list)
+static int scrcpy_parse_adb_devices_from_string(const char *text, obs_property_t *list, const char *compare_serial,
+						bool *seen)
 {
 	char buffer[4096];
 	char *line;
@@ -656,6 +777,8 @@ static int scrcpy_parse_adb_devices_from_string(const char *text, obs_property_t
 			continue;
 
 		obs_property_list_add_string(list, serial, serial);
+		if (seen && compare_serial && strcmp(serial, compare_serial) == 0)
+			*seen = true;
 		++found;
 	}
 
@@ -671,7 +794,7 @@ static int scrcpy_parse_adb_devices(FILE *pipe, obs_property_t *list)
 		total = strlen(output);
 	output[total] = '\0';
 
-	return scrcpy_parse_adb_devices_from_string(output, list);
+	return scrcpy_parse_adb_devices_from_string(output, list, NULL, NULL);
 }
 static bool scrcpy_run_adb_command(const char *adb_path, const char *args, char *output, size_t output_size)
 {
@@ -822,6 +945,8 @@ static int scrcpy_discover_mdns_devices(const char *adb_path)
 static int scrcpy_refresh_device_list(struct scrcpy_source *context, obs_property_t *list)
 {
 	const char *adb_path = DEFAULT_ADB_PATH;
+	const char *configured_serial = NULL;
+	bool serial_seen = false;
 	int found = 0;
 	char devices_output[4096];
 
@@ -831,16 +956,22 @@ static int scrcpy_refresh_device_list(struct scrcpy_source *context, obs_propert
 	if (context && context->adb_path && context->adb_path[0])
 		adb_path = context->adb_path;
 
+	/* The currently configured serial must stay selectable across a rescan
+	 * even when adb stops listing the device (e.g. it went offline). */
+	if (context && context->device_serial && context->device_serial[0] &&
+	    !scrcpy_is_placeholder_serial(context->device_serial))
+		configured_serial = context->device_serial;
+
 	obs_property_list_clear(list);
-	obs_property_list_add_string(list, "(Select device)", "");
+	obs_property_list_add_string(list, DEVICE_LIST_PLACEHOLDERS[DEVICE_LIST_PLACEHOLDER_SELECT_DEVICE], "");
 
 	if (!scrcpy_run_adb_command(adb_path, "devices -l", devices_output, sizeof(devices_output))) {
 		obs_log(LOG_WARNING, "failed to run adb command using '%s'", adb_path);
-		obs_property_list_add_string(list, "ADB command failed", "");
+		obs_property_list_add_string(list, DEVICE_LIST_PLACEHOLDERS[DEVICE_LIST_PLACEHOLDER_ADB_FAILED], "");
 		return 0;
 	}
 
-	found = scrcpy_parse_adb_devices_from_string(devices_output, list);
+	found = scrcpy_parse_adb_devices_from_string(devices_output, list, configured_serial, &serial_seen);
 
 	/*
 	 * If no devices were found via adb devices, attempt to discover wireless
@@ -852,14 +983,22 @@ static int scrcpy_refresh_device_list(struct scrcpy_source *context, obs_propert
 		obs_log(LOG_INFO, "scrcpy: no devices listed, scanning mDNS for wireless debug devices");
 		if (scrcpy_discover_mdns_devices(adb_path) > 0) {
 			obs_property_list_clear(list);
-			obs_property_list_add_string(list, "(Select device)", "");
+			obs_property_list_add_string(
+				list, DEVICE_LIST_PLACEHOLDERS[DEVICE_LIST_PLACEHOLDER_SELECT_DEVICE], "");
+			serial_seen = false;
 			if (scrcpy_run_adb_command(adb_path, "devices -l", devices_output, sizeof(devices_output)))
-				found = scrcpy_parse_adb_devices_from_string(devices_output, list);
+				found = scrcpy_parse_adb_devices_from_string(devices_output, list, configured_serial,
+									     &serial_seen);
 		}
 	}
 
 	if (found == 0)
-		obs_property_list_add_string(list, "No online ADB devices", "");
+		obs_property_list_add_string(list, DEVICE_LIST_PLACEHOLDERS[DEVICE_LIST_PLACEHOLDER_NO_DEVICES], "");
+
+	/* Re-add the configured serial when the scan did not list it so it stays
+	 * selectable in the combo instead of silently vanishing. */
+	if (configured_serial && !serial_seen)
+		obs_property_list_add_string(list, configured_serial, configured_serial);
 
 	obs_log(LOG_INFO, "scrcpy discovered %d ADB device(s)", found);
 	return found;
