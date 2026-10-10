@@ -1863,6 +1863,7 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 	uint32_t width = 0;
 	uint32_t height = 0;
 	int reconnect_attempts = 0;
+	bool ever_connected = false;
 
 	if (!session)
 		return 0;
@@ -2031,6 +2032,7 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 
 				if (scrcpy_read_handshake(session, &codec_id, &width, &height)) {
 					handshake_ok = true;
+					ever_connected = true;
 					reconnect_attempts = 0;
 					break;
 				}
@@ -2119,6 +2121,19 @@ static SCRCPY_THREAD_API scrcpy_session_worker(void *opaque)
 			break;
 
 		reconnect_attempts++;
+		/*
+		 * A bootstrap that never reached the device (wrong/partial serial,
+		 * adb broken) must not retry forever: it would hammer adb the whole
+		 * time the user edits the serial in the properties. Once a stream was
+		 * established, keep the long reconnect budget for real disconnects
+		 * (device reboot, wireless dropout).
+		 */
+		if (!ever_connected && reconnect_attempts >= 5) {
+			obs_log(LOG_ERROR,
+				"scrcpy bootstrap failed %d times for device '%s'; giving up until settings change",
+				reconnect_attempts, session->device_serial);
+			break;
+		}
 		if (reconnect_attempts >= 100) {
 			obs_log(LOG_ERROR, "scrcpy auto-reconnect failed 100 times. Giving up.");
 			break;
