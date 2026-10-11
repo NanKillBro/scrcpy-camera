@@ -106,24 +106,13 @@ struct scrcpy_session {
 	char *audio_source;
 	char *audio_codec;
 	uint32_t audio_bit_rate;
-	/* Low-latency level: 0=Off, 1=Low, 2=Medium, 3=High */
-	uint8_t low_latency_level;
-
 	/*
-	 * Latency-drift tracking state (video decode loop).
-	 * The scrcpy frame header carries a 61-bit device capture PTS; comparing
-	 * its advance against host wall-clock arrival measures end-to-end backlog
-	 * across the whole pipeline (device encoder, adb, TCP, decoder).
+	 * Low-latency level: 0=Off, 1=Low, 2=Medium. Tunes the socket
+	 * receive buffer, the decoder flags and OBS unbuffered async output.
+	 * Stale frames are discarded by OBS at render time, never cut out of the
+	 * bitstream — see the note in scrcpy_decode_loop().
 	 */
-	bool age_mapping_valid;    /* base_pts_ns/base_wall_ns are usable */
-	uint64_t age_base_pts_ns;  /* device PTS (ns) seen when mapping was (re)based */
-	uint64_t age_base_wall_ns; /* host monotonic time (ns) when mapping was (re)based */
-	uint64_t age_last_pts_ns;  /* last valid PTS seen, for discontinuity detection */
-	uint64_t age_max_ns;       /* max observed packet age since last stats log */
-	bool catch_up_active;      /* dropping stale packets until the next keyframe */
-	uint64_t dropped_packets;  /* packets discarded by catch-up (this session) */
-	uint64_t catch_up_events;  /* number of catch-up episodes (this session) */
-	uint64_t last_stats_ns;    /* last rate-limited stats log time */
+	uint8_t low_latency_level;
 
 	scrcpy_session_frame_callback on_frame;
 	void *on_frame_opaque;
@@ -708,9 +697,12 @@ static bool scrcpy_open_video_socket(struct scrcpy_session *session)
 			 *   Level 0 (Off):    256 KB rcvbuf, 250 ms timeout
 			 *   Level 1 (Low):     64 KB rcvbuf, 100 ms timeout
 			 *   Level 2 (Medium):  32 KB rcvbuf,  50 ms timeout
-			 *   Level 3 (High):    16 KB rcvbuf,  30 ms timeout
 			 * Smaller buffers reduce buffering delay at the cost of
 			 * burst tolerance; shorter timeouts improve responsiveness.
+			 * Do not shrink these below one keyframe payload: this is a
+			 * loopback socket (adb forward), so a small buffer buys no
+			 * latency, and a full one stalls the device encoder via TCP
+			 * backpressure instead.
 			 */
 			int rcvbuf;
 			int nodelay = 1; /* OPT #3: Disable Nagle for lower latency */
@@ -722,10 +714,6 @@ static bool scrcpy_open_video_socket(struct scrcpy_session *session)
 			case 2:
 				rcvbuf = 32 * 1024;
 				timeout_ms = 50;
-				break;
-			case 3:
-				rcvbuf = 16 * 1024;
-				timeout_ms = 30;
 				break;
 			default:                     /* Level 0: Off */
 				rcvbuf = 256 * 1024; /* OPT #2: 256KB receive buffer for burst absorption */
@@ -805,76 +793,6 @@ static bool scrcpy_read_exact(struct scrcpy_session *session, SOCKET sock, void 
 static uint32_t scrcpy_read_be32(const uint8_t *data)
 {
 	return ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
-}
-
-static uint64_t scrcpy_read_be64(const uint8_t *data)
-{
-	return ((uint64_t)scrcpy_read_be32(data) << 32) | scrcpy_read_be32(data + 4);
-}
-
-/*
- * Catch-up thresholds per low-latency level (nanoseconds).
- * Level 0 disables active dropping entirely (legacy behavior).
- * trigger: enter catch-up when packet age exceeds this.
- * resume: while catching up, only decode from a keyframe whose age is at or below this.
- */
-static void scrcpy_get_catch_up_thresholds(uint8_t level, uint64_t *trigger_ns, uint64_t *resume_ns)
-{
-	switch (level) {
-	case 1:
-		*trigger_ns = 150000000ULL; /* 150 ms */
-		*resume_ns = 75000000ULL;   /* 75 ms */
-		break;
-	case 2:
-		*trigger_ns = 100000000ULL; /* 100 ms */
-		*resume_ns = 50000000ULL;   /* 50 ms */
-		break;
-	case 3:
-		*trigger_ns = 60000000ULL; /* 60 ms */
-		*resume_ns = 30000000ULL;  /* 30 ms */
-		break;
-	default:
-		*trigger_ns = 0;
-		*resume_ns = 0;
-		break;
-	}
-}
-
-/*
- * Compute the current end-to-end packet age (backlog) in nanoseconds using the
- * session PTS<->wall-clock mapping. Returns false when the age is not
- * measurable for this packet (invalid PTS or first packet after a reset);
- * in that case the mapping is (re)based so the next packet is measurable.
- *
- * Slow clock skew between device and host accumulates in the mapping; a
- * periodic rebase on catch-up resume keeps the error bounded, and a negative
- * skew never triggers dropping.
- */
-static bool scrcpy_measure_packet_age(struct scrcpy_session *session, uint64_t pts_ns, uint64_t now_ns,
-				      uint64_t *age_ns)
-{
-	const uint64_t discontinuity_ns = 500000000ULL; /* 500 ms backwards jump */
-
-	if (pts_ns == 0)
-		return false;
-
-	/* PTS went backwards (encoder restart, device clock reset): rebase */
-	if (session->age_mapping_valid && pts_ns + discontinuity_ns < session->age_last_pts_ns)
-		session->age_mapping_valid = false;
-
-	session->age_last_pts_ns = pts_ns;
-
-	if (!session->age_mapping_valid) {
-		session->age_base_pts_ns = pts_ns;
-		session->age_base_wall_ns = now_ns;
-		session->age_mapping_valid = true;
-		return false;
-	}
-
-	uint64_t wall_advance = now_ns - session->age_base_wall_ns;
-	uint64_t pts_advance = pts_ns - session->age_base_pts_ns;
-	*age_ns = wall_advance > pts_advance ? wall_advance - pts_advance : 0;
-	return true;
 }
 
 static bool scrcpy_read_handshake(struct scrcpy_session *session, enum AVCodecID *codec_id, uint32_t *width,
@@ -1126,9 +1044,11 @@ static bool scrcpy_init_decoder(struct scrcpy_session *session, enum AVCodecID c
 	 *               so frames are emitted as soon as they're decoded.
 	 *   Level >= 2: AV_CODEC_FLAG2_FAST — enables speed optimizations that may
 	 *               not conform to the spec but reduce decode time.
-	 *   Level >= 3: skip_loop_filter = AVDISCARD_ALL — skips the in-loop
-	 *               deblocking filter entirely; saves ~1 frame of decode time
-	 *               at the cost of slight edge blockiness.
+	 *
+	 * Nothing here touches skip_loop_filter. Disabling the in-loop deblocking
+	 * filter makes our reference pictures diverge from the encoder's, and the
+	 * error compounds through every P-frame until the next IDR — a full 10
+	 * seconds at the scrcpy server's default GOP.
 	 */
 	if (session->low_latency_level >= 1) {
 		context->flags |= AV_CODEC_FLAG_LOW_DELAY;
@@ -1137,10 +1057,6 @@ static bool scrcpy_init_decoder(struct scrcpy_session *session, enum AVCodecID c
 	if (session->low_latency_level >= 2) {
 		context->flags2 |= AV_CODEC_FLAG2_FAST;
 		obs_log(LOG_INFO, "low-latency: decoder flag AV_CODEC_FLAG2_FAST enabled");
-	}
-	if (session->low_latency_level >= 3) {
-		context->skip_loop_filter = AVDISCARD_ALL;
-		obs_log(LOG_INFO, "low-latency: skip_loop_filter set to AVDISCARD_ALL");
 	}
 
 	if (avcodec_open2(context, codec, NULL) < 0) {
@@ -1257,8 +1173,6 @@ static bool scrcpy_decode_loop(struct scrcpy_session *session, AVCodecContext *d
 	bool warned_format = false;
 	uint8_t *codec_config = NULL;
 	size_t codec_config_size = 0;
-	uint64_t trigger_ns;
-	uint64_t resume_ns;
 
 	/* OPT #8: Pre-allocate a persistent read buffer to avoid av_new_packet malloc/free
 	 * per frame. The buffer auto-grows for large payloads and is reused across frames.
@@ -1278,29 +1192,21 @@ static bool scrcpy_decode_loop(struct scrcpy_session *session, AVCodecContext *d
 
 	obs_log(LOG_INFO, "scrcpy decode loop starting (socket=%lld)", (long long)session->video_socket);
 
-	/* Reset latency tracking for this connection. */
-	scrcpy_get_catch_up_thresholds(session->low_latency_level, &trigger_ns, &resume_ns);
-	session->age_mapping_valid = false;
-	session->age_last_pts_ns = 0;
-	session->age_max_ns = 0;
-	session->catch_up_active = false;
-	session->dropped_packets = 0;
-	session->catch_up_events = 0;
-	session->last_stats_ns = 0;
-
-	if (trigger_ns > 0)
-		obs_log(LOG_INFO,
-			"low-latency: active (level=%u, drop stale frames beyond %llums, resume below %llums)",
-			(unsigned)session->low_latency_level, (unsigned long long)(trigger_ns / 1000000ULL),
-			(unsigned long long)(resume_ns / 1000000ULL));
+	/*
+	 * No packet dropping happens here by design. Stale-frame discard belongs
+	 * downstream: obs_source_set_async_unbuffered() (see scrcpy_source_update)
+	 * makes OBS render the newest frame and drop older ones, which is a real
+	 * frame skip. Dropping compressed packets instead cannot work — P-frames
+	 * reference earlier pictures, so a cut forces a wait for the next keyframe,
+	 * and the scrcpy server encodes with a 10-second GOP
+	 * (SurfaceEncoder.DEFAULT_I_FRAME_INTERVAL). That turned a backlog into a
+	 * multi-second freeze, so the decode loop now feeds the decoder every
+	 * packet it receives.
+	 */
 
 	while (!scrcpy_should_stop(session)) {
 		uint32_t payload_size;
 		bool is_session_packet;
-		uint64_t now_ns;
-		uint64_t pts_ns;
-		uint64_t age_ns = 0;
-		bool age_valid;
 
 		if (!scrcpy_read_exact(session, session->video_socket, header, sizeof(header))) {
 			obs_log(LOG_WARNING, "scrcpy decode loop: header read failed (WSA=%d)", WSAGetLastError());
@@ -1316,29 +1222,10 @@ static bool scrcpy_decode_loop(struct scrcpy_session *session, AVCodecContext *d
 		}
 
 		/*
-		 * Packet age: under the 3 flag bits of the first header u64 sits the
-		 * 61-bit device capture PTS in microseconds. Comparing its advance
-		 * against wall-clock arrival measures end-to-end backlog across the
-		 * whole pipeline (device encoder, adb, TCP, decoder).
+		 * Under the 3 flag bits of the first header u64 sits the 61-bit device
+		 * capture PTS in microseconds. OBS timestamps frames on arrival instead
+		 * (see scrcpy_output_decoded_frames), so the PTS is not read.
 		 */
-		now_ns = os_gettime_ns();
-		pts_ns = (scrcpy_read_be64(header) & 0x1fffffffffffffffULL) * 1000ULL;
-		age_valid = scrcpy_measure_packet_age(session, pts_ns, now_ns, &age_ns);
-		if (age_valid && age_ns > session->age_max_ns)
-			session->age_max_ns = age_ns;
-
-		if (session->last_stats_ns == 0)
-			session->last_stats_ns = now_ns;
-		else if (now_ns - session->last_stats_ns >= 5000000000ULL) {
-			obs_log(LOG_DEBUG, "low-latency: level=%u age=%llums max_age=%llums dropped=%llu events=%llu",
-				(unsigned)session->low_latency_level,
-				(unsigned long long)(age_valid ? age_ns / 1000000ULL : 0),
-				(unsigned long long)(session->age_max_ns / 1000000ULL),
-				(unsigned long long)session->dropped_packets,
-				(unsigned long long)session->catch_up_events);
-			session->age_max_ns = 0;
-			session->last_stats_ns = now_ns;
-		}
 
 		payload_size = scrcpy_read_be32(header + 8);
 		if (payload_size == 0)
@@ -1381,44 +1268,6 @@ static bool scrcpy_decode_loop(struct scrcpy_session *session, AVCodecContext *d
 			codec_config_size = payload_size;
 			packet->flags = 0;
 			continue;
-		}
-
-		/*
-		 * Catch-up (the actual anti-drift mechanism): when the packet age exceeds
-		 * the trigger threshold, stop feeding stale inter-frames to the decoder but
-		 * keep consuming headers and payloads so TCP backpressure does not
-		 * preserve the backlog. Resume decoding only at a keyframe that is fresh
-		 * enough; never decode mid-GOP after skipping, because later frames would
-		 * reference dropped pictures and corrupt. Flushing the decoder at resume
-		 * discards the abandoned dependency chain.
-		 */
-		if (trigger_ns > 0) {
-			bool is_keyframe = (header[0] & 0x20U) != 0;
-
-			if (!session->catch_up_active && age_valid && age_ns > trigger_ns) {
-				session->catch_up_active = true;
-				session->catch_up_events++;
-				obs_log(LOG_INFO,
-					"low-latency: backlog %lldms exceeds %llums, dropping stale frames until next keyframe",
-					(long long)(age_ns / 1000000ULL),
-					(unsigned long long)(trigger_ns / 1000000ULL));
-			}
-
-			if (session->catch_up_active) {
-				if (is_keyframe && age_valid && age_ns <= resume_ns) {
-					session->catch_up_active = false;
-					avcodec_flush_buffers(decoder_context);
-					session->age_mapping_valid = false; /* rebase age at this keyframe */
-					obs_log(LOG_INFO,
-						"low-latency: caught up at keyframe (age %lldms, %llu packet(s) dropped total)",
-						(long long)(age_ns / 1000000ULL),
-						(unsigned long long)session->dropped_packets);
-				} else {
-					session->dropped_packets++;
-					packet->flags = 0;
-					continue;
-				}
-			}
 		}
 
 		/*
@@ -1549,10 +1398,6 @@ static bool scrcpy_open_audio_socket(struct scrcpy_session *session)
 			case 2:
 				rcvbuf = 32 * 1024;
 				timeout_ms = 50;
-				break;
-			case 3:
-				rcvbuf = 16 * 1024;
-				timeout_ms = 30;
 				break;
 			default:                     /* Level 0: Off */
 				rcvbuf = 256 * 1024; /* OPT #2: 256KB receive buffer */
@@ -1690,8 +1535,7 @@ static bool scrcpy_audio_decode_loop(struct scrcpy_session *session, AVCodecCont
 			 * monotonic audio timestamp can drift from wall clock
 			 * before resetting. Tighter windows at higher low-latency
 			 * levels keep audio more closely synced to real-time.
-			 *   Level 0: 100 ms, Level 1: 50 ms,
-			 *   Level 2: 30 ms, Level 3: 20 ms
+			 *   Level 0: 100 ms, Level 1: 50 ms, Level 2: 30 ms
 			 */
 			uint64_t audio_drift_ns;
 			switch (session->low_latency_level) {
@@ -1701,9 +1545,6 @@ static bool scrcpy_audio_decode_loop(struct scrcpy_session *session, AVCodecCont
 			case 2:
 				audio_drift_ns = 30000000ULL;
 				break; /* 30 ms */
-			case 3:
-				audio_drift_ns = 20000000ULL;
-				break; /* 20 ms */
 			default:
 				audio_drift_ns = 100000000ULL;
 				break; /* 100 ms */
@@ -1808,9 +1649,6 @@ static bool scrcpy_audio_decode_loop(struct scrcpy_session *session, AVCodecCont
 				case 2:
 					audio_drift_ns = 30000000ULL;
 					break; /* 30 ms */
-				case 3:
-					audio_drift_ns = 20000000ULL;
-					break; /* 20 ms */
 				default:
 					audio_drift_ns = 100000000ULL;
 					break; /* 100 ms */

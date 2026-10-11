@@ -159,7 +159,7 @@ struct scrcpy_source {
 	uint32_t frame_height;
 	bool hw_decoding;
 	bool audio_enabled;
-	/* Low-latency level: 0=Off, 1=Low, 2=Medium, 3=High */
+	/* Low-latency level: 0=Off, 1=Low, 2=Medium */
 	uint8_t low_latency_level;
 	bool active;
 	bool restart_pending;
@@ -332,12 +332,17 @@ static void scrcpy_source_update(void *data, obs_data_t *settings)
 		context->camera_high_speed = false;
 	}
 
-	/* Low-latency level: clamp to [0..3] range */
+	/*
+	 * Low-latency level: clamp to [0..2]. A former level 3 ("High") disabled the
+	 * in-loop deblocking filter and shrank the receive buffer below one keyframe;
+	 * it stalled the stream into a slideshow and is gone. Scenes saved with 3
+	 * clamp down to Medium.
+	 */
 	long long low_latency = obs_data_get_int(settings, SETTING_LOW_LATENCY);
 	if (low_latency < 0)
 		low_latency = 0;
-	if (low_latency > 3)
-		low_latency = 3;
+	if (low_latency > 2)
+		low_latency = 2;
 	context->low_latency_level = (uint8_t)low_latency;
 
 	/*
@@ -404,8 +409,8 @@ static void scrcpy_source_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, SETTING_AUDIO_SOURCE, "output");
 	obs_data_set_default_string(settings, SETTING_AUDIO_CODEC, "opus");
 	obs_data_set_default_int(settings, SETTING_AUDIO_BIT_RATE, 128);
-	/* Default Low: only drops frames once the backlog exceeds 150 ms, which never
-	 * happens on a healthy connection; it only acts to recover after stalls. */
+	/* Default Low: unbuffered async output plus AV_CODEC_FLAG_LOW_DELAY, which
+	 * keeps latency flat without touching decode quality. */
 	obs_data_set_default_int(settings, SETTING_LOW_LATENCY, 1);
 }
 
@@ -568,15 +573,14 @@ static obs_properties_t *scrcpy_source_properties(void *unused)
 
 	obs_properties_add_bool(props, SETTING_HW_DECODING, "Use Hardware Decoding");
 
-	/* Low-latency dropdown: controls backlog catch-up thresholds, socket buffer
-	 * sizes, decoder flags, and OBS unbuffered async output. Higher levels
-	 * recover more aggressively at the cost of dropping more frames. */
+	/* Low-latency dropdown: controls the socket receive buffer and timeouts,
+	 * decoder flags, and OBS unbuffered async output. No level cuts packets out
+	 * of the bitstream — OBS discards stale frames at render time. */
 	obs_property_t *latency_list = obs_properties_add_list(props, SETTING_LOW_LATENCY, "Low Latency",
 							       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(latency_list, "Off (no frame dropping)", 0);
-	obs_property_list_add_int(latency_list, "Low (default, 150 ms)", 1);
-	obs_property_list_add_int(latency_list, "Medium (100 ms)", 2);
-	obs_property_list_add_int(latency_list, "High (60 ms)", 3);
+	obs_property_list_add_int(latency_list, "Off (buffered pacing)", 0);
+	obs_property_list_add_int(latency_list, "Low (default, unbuffered)", 1);
+	obs_property_list_add_int(latency_list, "Medium (+ fast decode)", 2);
 
 	obs_properties_add_int_slider(props, SETTING_VIDEO_BIT_RATE, "Video bitrate (Mbps)", 1, 50, 1);
 
