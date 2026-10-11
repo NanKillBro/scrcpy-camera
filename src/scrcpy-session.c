@@ -74,7 +74,7 @@
 #define SCRCPY_THREAD_API void *
 #endif
 
-#define DEFAULT_SCRCPY_VERSION "4.0"
+#define DEFAULT_SCRCPY_VERSION "5.0.1"
 #define SCRCPY_META_DEVICE_NAME_SIZE 64
 #define SCRCPY_SESSION_PACKET_SIZE 12
 #define SCRCPY_FRAME_HEADER_SIZE 12
@@ -98,7 +98,9 @@ struct scrcpy_session {
 	bool camera_high_speed; /* camera only; requires camera_fps > 0 */
 	uint32_t scid;
 	bool hw_decoding;
-	enum AVHWDeviceType hw_device_type;
+	/* Hardware surface format of the selected decode backend, taken from the
+	 * codec's own AVCodecHWConfig. AV_PIX_FMT_NONE when decoding in software. */
+	enum AVPixelFormat hw_pix_fmt;
 
 	bool audio_enabled;
 	char *audio_source;
@@ -959,58 +961,59 @@ static bool scrcpy_read_handshake(struct scrcpy_session *session, enum AVCodecID
 	return true;
 }
 
+/*
+ * Find the codec's hwaccel config for a device type, or NULL if the codec
+ * cannot be decoded with it. Returning the config rather than a bool lets the
+ * caller capture config->pix_fmt, which is the authoritative surface format for
+ * that pairing — far more robust than matching av_get_pix_fmt_name() strings.
+ *
+ * Ported from sc_hwdec_is_supported_by_codec() in scrcpy v5's app/src/hwdec.c.
+ */
+static const AVCodecHWConfig *scrcpy_find_hw_config(const AVCodec *codec, enum AVHWDeviceType hw_type)
+{
+	for (int i = 0;; ++i) {
+		const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
+		if (!config)
+			return NULL;
+
+		if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) && config->device_type == hw_type)
+			return config;
+	}
+}
+
 static enum AVPixelFormat scrcpy_get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts)
 {
 	struct scrcpy_session *session = ctx->opaque;
 	const enum AVPixelFormat *p;
 	char fmts_str[256] = {0};
-	for (p = pix_fmts; *p != -1; p++) {
+
+	for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
 		const char *name = av_get_pix_fmt_name(*p);
+
 		if (name) {
 			strncat(fmts_str, name, sizeof(fmts_str) - strlen(fmts_str) - 1);
 			strncat(fmts_str, ", ", sizeof(fmts_str) - strlen(fmts_str) - 1);
+		}
 
-			if (session) {
-				if (session->hw_device_type == AV_HWDEVICE_TYPE_D3D11VA) {
-					if (strcmp(name, "d3d11") == 0 || strcmp(name, "d3d11va_vld") == 0) {
-						obs_log(LOG_INFO, "HW surface format selected: %s", name);
-						return *p;
-					}
-				} else if (session->hw_device_type == AV_HWDEVICE_TYPE_DXVA2) {
-					if (strcmp(name, "dxva2_vld") == 0) {
-						obs_log(LOG_INFO, "HW surface format selected: %s", name);
-						return *p;
-					}
-				} else if (session->hw_device_type == AV_HWDEVICE_TYPE_CUDA) {
-					if (strcmp(name, "cuda") == 0) {
-						obs_log(LOG_INFO, "HW surface format selected: %s", name);
-						return *p;
-					}
-				} else if (session->hw_device_type == AV_HWDEVICE_TYPE_QSV) {
-					if (strcmp(name, "qsv") == 0) {
-						obs_log(LOG_INFO, "HW surface format selected: %s", name);
-						return *p;
-					}
-				} else if (session->hw_device_type == AV_HWDEVICE_TYPE_VAAPI) {
-					if (strcmp(name, "vaapi") == 0) {
-						obs_log(LOG_INFO, "HW surface format selected: %s", name);
-						return *p;
-					}
-				} else if (session->hw_device_type == AV_HWDEVICE_TYPE_VDPAU) {
-					if (strcmp(name, "vdpau") == 0) {
-						obs_log(LOG_INFO, "HW surface format selected: %s", name);
-						return *p;
-					}
-				}
-			}
+		if (session && session->hw_pix_fmt != AV_PIX_FMT_NONE && *p == session->hw_pix_fmt) {
+			obs_log(LOG_INFO, "HW surface format selected: %s", name ? name : "(unnamed)");
+			return *p;
 		}
 	}
-	// We only log this once to avoid spamming
+
+	/*
+	 * Fall back to software rather than failing the source: a stream the GPU
+	 * cannot handle should still show up in OBS. The decoder actually in use
+	 * is reported by scrcpy_init_decoder(), so this only has to explain the
+	 * rejection. Logged once to avoid per-frame spam.
+	 */
 	static bool warned = false;
 	if (!warned) {
+		const char *want = session ? av_get_pix_fmt_name(session->hw_pix_fmt) : NULL;
+
 		obs_log(LOG_WARNING,
-			"failed to get HW surface format, available formats: %s. Hardware decoding will not be used",
-			fmts_str);
+			"hardware decoding unavailable for this stream: the decoder offered no %s surface (formats: %s); falling back to software decoding",
+			want ? want : "hardware", fmts_str);
 		warned = true;
 	}
 	return pix_fmts[0];
@@ -1022,33 +1025,59 @@ static bool scrcpy_init_decoder(struct scrcpy_session *session, enum AVCodecID c
 	const AVCodec *codec = avcodec_find_decoder(codec_id);
 	AVCodecContext *context;
 	AVBufferRef *hw_device_ctx = NULL;
+	const char *hw_name = NULL;
 
 	if (!codec) {
 		obs_log(LOG_ERROR, "ffmpeg decoder not found for codec id %d", (int)codec_id);
 		return false;
 	}
 
-	session->hw_device_type = AV_HWDEVICE_TYPE_NONE;
+	session->hw_pix_fmt = AV_PIX_FMT_NONE;
 
 	if (session->hw_decoding) {
+		/* Priority order is deliberate and unchanged: NVIDIA first, then the
+		 * open stacks, then the Windows backends. */
 		const char *hw_types[] = {"cuda", "vaapi", "vdpau", "qsv", "d3d11va", "dxva2", NULL};
-		enum AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_NONE;
 
 		for (int i = 0; hw_types[i]; i++) {
-			hw_type = av_hwdevice_find_type_by_name(hw_types[i]);
-			if (hw_type != AV_HWDEVICE_TYPE_NONE) {
-				int err = av_hwdevice_ctx_create(&hw_device_ctx, hw_type, NULL, NULL, 0);
-				if (err == 0) {
-					obs_log(LOG_INFO, "hardware decoding context created successfully: %s",
-						hw_types[i]);
-					session->hw_device_type = hw_type;
-					break;
-				}
+			enum AVHWDeviceType hw_type = av_hwdevice_find_type_by_name(hw_types[i]);
+			const AVCodecHWConfig *hw_config;
+			int err;
+
+			if (hw_type == AV_HWDEVICE_TYPE_NONE)
+				continue; /* backend not compiled into this ffmpeg */
+
+			/*
+			 * Ask whether this codec can actually be decoded with this
+			 * backend *before* creating a device for it. Creating the
+			 * device first (as this code used to) succeeds on any machine
+			 * with the hardware present even when the codec has no config
+			 * for it — the mismatch then surfaced only in get_format(),
+			 * which silently software-decoded with a GPU context attached.
+			 */
+			hw_config = scrcpy_find_hw_config(codec, hw_type);
+			if (!hw_config) {
+				obs_log(LOG_INFO, "hardware decoding: %s decoder has no %s config, skipping",
+					codec->name, hw_types[i]);
+				continue;
 			}
+
+			err = av_hwdevice_ctx_create(&hw_device_ctx, hw_type, NULL, NULL, 0);
+			if (err < 0) {
+				obs_log(LOG_INFO, "hardware decoding: %s supports %s but no device is available",
+					codec->name, hw_types[i]);
+				hw_device_ctx = NULL;
+				continue;
+			}
+
+			session->hw_pix_fmt = hw_config->pix_fmt;
+			hw_name = hw_types[i];
+			break;
 		}
 
 		if (!hw_device_ctx) {
-			obs_log(LOG_WARNING, "failed to create any hardware device context, falling back to software");
+			obs_log(LOG_WARNING, "no usable hardware decoder for %s, falling back to software decoding",
+				codec->name);
 		}
 	}
 
@@ -1065,6 +1094,17 @@ static bool scrcpy_init_decoder(struct scrcpy_session *session, enum AVCodecID c
 		context->opaque = session;
 		context->get_format = scrcpy_get_hw_format;
 		av_buffer_unref(&hw_device_ctx);
+
+		/*
+		 * Some backends only advertise Constrained Baseline, while hardware
+		 * that handles Main/High decodes plain Baseline fine. Restrict this to
+		 * H.264: for H.265, FFmpeg would select the Main10 D3D11VA decoder for
+		 * a Main stream (scrcpy commit f6dce15c), and a 10-bit surface would
+		 * then be dropped outright by the YUV420P/NV12 check in
+		 * scrcpy_output_decoded_frames() — a silently black source.
+		 */
+		if (codec_id == AV_CODEC_ID_H264)
+			context->hwaccel_flags |= AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH;
 	}
 
 	/* OPT #7: Enable slice-threading for software decode to parallelize
@@ -1109,7 +1149,17 @@ static bool scrcpy_init_decoder(struct scrcpy_session *session, enum AVCodecID c
 		return false;
 	}
 
-	// obs_log(LOG_INFO, "[DEBUG] ffmpeg decoder initialized successfully (hw_decoding=%d, threads=%d)", session->hw_decoding, context->thread_count);
+	/*
+	 * Name the decoder that is actually in use. get_format() can still demote
+	 * this to software on the first frame if the backend turns out not to
+	 * handle the stream; it logs its own warning when that happens.
+	 */
+	if (hw_name)
+		obs_log(LOG_INFO, "video decoding: %s (%s)", hw_name, codec->name);
+	else if (context->thread_count > 0)
+		obs_log(LOG_INFO, "video decoding: software (%s, %d threads)", codec->name, context->thread_count);
+	else
+		obs_log(LOG_INFO, "video decoding: software (%s)", codec->name);
 
 	*decoder_context = context;
 	return true;
